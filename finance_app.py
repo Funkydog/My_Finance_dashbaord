@@ -45,16 +45,37 @@ session = Session()
 
 # --- 2. CONFIGURATION & MAPPING ---
 
-# Mapping Strategy Names -> Real Yahoo Finance Tickers
 FUND_MAP = {
-    'Global Index Fund': {'isin': '0P00018V9L', 'name': 'KLP AksjeGlobal P'},
-    'Nordic Fund': {'isin': '0P0001CTL0', 'name': 'DNB Norden Indeks A'},
-    'European Fund': {'isin': '0P00016TML', 'name': 'KLP AksjeEuropa Indeks P'},
-    'Norwegian Fund': {'isin': '0P0001LR0Y', 'name': 'Norne Aksje Norge'},
-
-    # Safe Assets (Fixed Price Proxy)
-    'Savings (Buffer)': {'isin': 'BANK_SAVINGS', 'name': 'Fana Bufferkonto', 'fixed_price': 1.0},
-    'Debt Paydown': {'isin': 'DEBT_PAYMENT', 'name': 'Mortgage Payment', 'fixed_price': 1.0},
+    'Global Index Fund': {
+        'isin': '0P00018V9L',
+        'name': 'KLP AksjeGlobal P',
+        'desc': 'Exposure to 1,500+ world companies. Heavily weighted in US Tech.',
+        'holdings': ['Apple', 'Microsoft', 'NVIDIA', 'Amazon'],
+        'sectors': ['Technology (24%)', 'Finance (14%)', 'Health (12%)']
+    },
+    'Nordic Fund': {
+        'isin': '0P0001CTL0',
+        'name': 'DNB Norden Indeks A',
+        'desc': 'Nordic stability. Strong on Pharma, Energy, and Industrials.',
+        'holdings': ['Novo Nordisk (DK)', 'Equinor (NO)', 'Atlas Copco (SE)', 'Investor AB'],
+        'sectors': ['Healthcare (35%)', 'Industrials (25%)', 'Energy (10%)']
+    },
+    'European Fund': {
+        'isin': '0P00016TML',
+        'name': 'KLP AksjeEuropa Indeks P',
+        'desc': 'Eurozone giants. Luxury, Semi-conductors, and Banking.',
+        'holdings': ['ASML (Tech)', 'LVMH (Luxury)', 'Nestle', 'SAP'],
+        'sectors': ['Consumer (20%)', 'Financials (18%)', 'Tech (8%)']
+    },
+    'Norwegian Fund': {
+        'isin': '0P0001LR0Y',
+        'name': 'Norne Aksje Norge',
+        'desc': 'Pure Norway exposure. Oil, Fish, and Aluminum.',
+        'holdings': ['Equinor', 'DNB', 'Norsk Hydro', 'Mowi'],
+        'sectors': ['Energy (30%)', 'Seafood (15%)', 'Materials (10%)']
+    },
+    'Savings (Buffer)': {'isin': 'BANK_SAVINGS', 'name': 'Fana Bufferkonto', 'fixed_price': 1.0, 'desc': 'Risk-free cash.'},
+    'Debt Paydown': {'isin': 'DEBT_PAYMENT', 'name': 'Mortgage Payment', 'fixed_price': 1.0, 'desc': 'Guaranteed 5.06% return.'},
 }
 
 
@@ -395,16 +416,17 @@ st.sidebar.caption(f"Exchange Rate: 1 {curr_sym} = {rate_div:.2f} NOK")
 # TABS
 tab1, tab2 = st.tabs(["🚀 Strategy Engine", "📊 Portfolio Overview"])
 
+
+# --- TAB 1: NEW INVESTMENT (Enhanced) ---
 with tab1:
     st.subheader("New Cash Allocation")
 
-    # 1. SETUP: Mode & Amount
+    # 1. SETUP
     mode = st.radio("Mode", ["Live (Today)", "Simulation (Backtest)"], horizontal=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
-        inv_amount_nok = st.number_input("Total Amount to Invest (NOK)", min_value=0.0, step=5000.0, value=0.0)
-
+        inv_amount_nok = st.number_input("Total Amount (NOK)", min_value=0.0, step=5000.0, value=0.0)
     with col_b:
         sim_date = datetime.now()
         if mode == "Simulation (Backtest)":
@@ -419,88 +441,93 @@ with tab1:
 
         rec_map = {}
         strategy_reason = ""
-        risk_score = 0
 
-        # Logic: Debt vs Market
         if real_debt > real_mkt:
             rec_map = {'Debt Paydown': inv_amount_nok}
-            risk_score = 1
-            strategy_reason = f"📉 **Defensive Strategy:** The after-tax cost of debt ({real_debt:.2f}%) is higher than the expected market return ({real_mkt:.2f}%). Paying down debt is the risk-free winner."
+            strategy_reason = f"📉 **Defensive Strategy:** The after-tax cost of debt ({real_debt:.2f}%) exceeds market expectations. We recommend paying down your loan."
         else:
-            # Growth Strategy: 70% Global, 20% Nordic, 10% Europe (Example Diversification)
             rec_map = {
                 'Global Index Fund': inv_amount_nok * 0.70,
                 'Nordic Fund': inv_amount_nok * 0.20,
                 'European Fund': inv_amount_nok * 0.10
             }
-            risk_score = 4
-            strategy_reason = f"📈 **Growth Strategy:** Market returns ({real_mkt:.2f}%) are expected to beat debt cost ({real_debt:.2f}%). We recommend a diversified equity split."
+            strategy_reason = f"📈 **Growth Strategy:** Market returns ({real_mkt:.2f}%) are superior to debt cost. We recommend a diversified portfolio."
 
-        # 3. DISPLAY PROPOSAL
         st.info(strategy_reason)
 
-        # 4. USER CUSTOMIZATION (The "Select & Modify" Section)
-        st.subheader("🛠 Customize & Confirm")
-        st.caption("The values below are pre-filled with the AI recommendation. You can modify them freely.")
+        # --- NEW: FUND INTELLIGENCE DISPLAY ---
+        if 'Fund' in list(rec_map.keys())[0]:
+            st.markdown("### 🔍 Proposed Fund Details")
+            cols = st.columns(len(rec_map))
 
+            for idx, (key, amount) in enumerate(rec_map.items()):
+                data = FUND_MAP.get(key, {})
+
+                with cols[idx]:
+                    # Create a "Card" for each fund
+                    st.markdown(f"**{key}**")
+                    st.caption(f"{data.get('name')}")
+
+                    # Show allocation amount
+                    st.metric("Allocation", f"{amount:,.0f} NOK",
+                              help=f"{(amount / inv_amount_nok) * 100:.0f}% of total")
+
+                    # Deep Dive Info
+                    with st.expander("See Holdings & Sectors", expanded=True):
+                        st.markdown(f"*{data.get('desc')}*")
+
+                        if 'holdings' in data:
+                            st.markdown("**🏆 Top Holdings:**")
+                            for h in data['holdings']:
+                                st.text(f"• {h}")
+
+                        if 'sectors' in data:
+                            st.markdown("**🏭 Key Sectors:**")
+                            for s in data['sectors']:
+                                st.text(f"• {s}")
+
+        # 3. USER CUSTOMIZATION
+        st.markdown("---")
+        st.subheader("🛠 Customize & Confirm")
         with st.form("allocation_form"):
             user_allocs = {}
-
-            # Create a 2-column layout for the input fields
             c1, c2 = st.columns(2)
             keys = list(FUND_MAP.keys())
 
             for i, key in enumerate(keys):
-                # Get the recommended amount (0 if not recommended)
                 rec_val = rec_map.get(key, 0.0)
-
-                # Display inputs (Alternating columns)
                 with (c1 if i % 2 == 0 else c2):
+                    # Show the specific fund name in the label for clarity
+                    fund_real_name = FUND_MAP[key].get('name')
                     user_allocs[key] = st.number_input(
-                        f"{key} (NOK)",
+                        f"{key} ({fund_real_name})",
                         min_value=0.0,
                         value=float(rec_val),
-                        step=1000.0,
-                        key=f"input_{key}"
+                        step=1000.0
                     )
 
-            # 5. VALIDATION & SUBMIT
             st.markdown("---")
-            total_user_input = sum(user_allocs.values())
-            diff = inv_amount_nok - total_user_input
+            total_input = sum(user_allocs.values())
+            diff = inv_amount_nok - total_input
 
-            # Dynamic Total Check
-            if abs(diff) > 1.0:  # Tolerance for float rounding
-                st.warning(
-                    f"⚠️ Allocation Mismatch: You have allocated **{total_user_input:,.0f} NOK**. You have **{diff:,.0f} NOK** remaining/overspent.")
-                ready_to_submit = False
+            if abs(diff) > 1.0:
+                st.warning(f"⚠️ Mismatch: Allocated {total_input:,.0f} vs Total {inv_amount_nok:,.0f}.")
+                ready = False
             else:
-                st.success(f"✅ Perfect Match: {total_user_input:,.0f} / {inv_amount_nok:,.0f} NOK allocated.")
-                ready_to_submit = True
+                st.success("✅ Allocation matches Total.")
+                ready = True
 
-            submitted = st.form_submit_button("Confirm & Log Investment")
-
-            if submitted:
-                if not ready_to_submit:
-                    st.error("Please adjust the values to match the Total Amount before confirming.")
-                else:
-                    # LOGGING LOGIC
+            if st.form_submit_button("Confirm Investment"):
+                if ready:
                     for key, amount in user_allocs.items():
                         if amount > 0:
-                            # Assign risk based on asset type
-                            final_risk = 4 if 'Fund' in key else (1 if 'Savings' in key or 'Debt' in key else 3)
-
-                            log_investment(
-                                amount=amount,
-                                strategy_key=key,
-                                risk=final_risk,
-                                year=sim_date.year,
-                                debt_rate=d_rate,
-                                date_override=sim_date if mode == "Simulation (Backtest)" else None
-                            )
-
-                    st.toast("Investment Logged Successfully!", icon="🎉")
+                            risk = 4 if 'Fund' in key else 1
+                            log_investment(amount, key, risk, sim_date.year, d_rate,
+                                           sim_date if mode == "Simulation (Backtest)" else None)
+                    st.toast("Saved!", icon="🎉")
                     st.rerun()
+                else:
+                    st.error("Fix totals first.")
 
 with tab2:
     st.subheader(f"Portfolio Valuation ({view_currency})")

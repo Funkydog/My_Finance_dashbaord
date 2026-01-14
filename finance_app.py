@@ -11,47 +11,32 @@ import json
 import re
 import requests
 
-# --- 1. DATABASE & MODEL SETUP (Local Storage) ---
+# --- 1. DATABASE SETUP ---
 Base = declarative_base()
-engine = create_engine('sqlite:///personal_finance_v2.db', echo=False)
-
+engine = create_engine('sqlite:///personal_finance_v4.db', echo=False)
 
 class FinancialRecord(Base):
     __tablename__ = 'financial_records'
     id = Column(Integer, primary_key=True)
     date = Column(DateTime, default=datetime.now)
     year = Column(Integer)
-    amount = Column(Float)  # Cash value invested at time T
-
-    # NEW COLUMNS
-    allocation_type = Column(String)  # Broader Category: 'Fund', 'Savings', 'Debt'
-    isin = Column(String, nullable=True)  # The Link: e.g., 'NO0010000000'
-    entry_price = Column(Float, nullable=True)  # Price of fund at moment of purchase
-    units_owned = Column(Float, nullable=True)  # Calculated: amount / entry_price
-
+    amount = Column(Float)
+    allocation_type = Column(String)
+    isin = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    units_owned = Column(Float, nullable=True)
     interest_rate_at_time = Column(Float)
     risk_score = Column(Integer)
-
-
-class MarketData(Base):
-    __tablename__ = 'market_data'
-    id = Column(Integer, primary_key=True)
-    year = Column(Integer, unique=True)
-    debt_rate = Column(Float)  # e.g., 5.06
-    savings_rate = Column(Float)  # e.g., 4.8
-    market_return_est = Column(Float)  # e.g., 7.0
-
-# --- Add this to Section 1: DATABASE & MODEL SETUP ---
 
 class FundPriceHistory(Base):
     __tablename__ = 'fund_price_history'
     id = Column(Integer, primary_key=True)
-    isin = Column(String, index=True) # Indexed for fast joins
+    isin = Column(String, index=True)
     fund_name = Column(String)
     date = Column(DateTime)
     close_price = Column(Float)
-    overall_rating = Column(Float)
-    risk_rating = Column(Float)
+    overall_rating = Column(Float, default=0.0)
+    risk_rating = Column(Float, default=0.0)
 
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
@@ -72,6 +57,18 @@ FUND_MAP = {
     'Debt Paydown': {'isin': 'DEBT_PAYMENT', 'name': 'Mortgage Payment', 'fixed_price': 1.0},
 }
 
+
+def get_exchange_rates():
+    """Fetches current NOK to EUR and USD rates."""
+    try:
+        tickers = yf.Tickers('EURNOK=X USDNOK=X')
+        rates = {
+            'EUR': tickers.tickers['EURNOK=X'].fast_info['last_price'],
+            'USD': tickers.tickers['USDNOK=X'].fast_info['last_price']
+        }
+        return rates
+    except Exception:
+        return {'EUR': 11.50, 'USD': 10.50} # Fallback
 
 # get funds
 def fetch_fund_history(isin, fund_name):
@@ -152,16 +149,10 @@ def update_database_with_history(session_obj):
 # --- 4. CORE LOGIC ---
 
 def get_latest_price(isin, default_val=1.0):
-    """Fetch most recent price from DB."""
     record = session.query(FundPriceHistory).filter_by(isin=isin).order_by(desc(FundPriceHistory.date)).first()
-    if record:
-        return record.close_price
-
-    # Check if it is a fixed asset (Savings/Debt)
-    for k, v in FUND_MAP.items():
-        if v.get('isin') == isin and 'fixed_price' in v:
-            return v['fixed_price']
-
+    if record: return record.close_price
+    for v in FUND_MAP.values():
+        if v.get('isin') == isin and 'fixed_price' in v: return v['fixed_price']
     return default_val
 
 
@@ -173,32 +164,40 @@ def get_fund_rating(isin):
     return 0
 
 
-def log_investment(amount, strategy_key, risk, year, debt_rate):
-    """Log investment using Real Market Price."""
+def log_investment(amount, strategy_key, risk, year, debt_rate, date_override=None):
     details = FUND_MAP.get(strategy_key, {})
     isin = details.get('isin', 'UNKNOWN')
 
-    current_price = get_latest_price(isin)
+    # Handle Simulations
+    if date_override:
+        rec_date = datetime.combine(date_override, datetime.min.time())
+        if 'fixed_price' in details:
+            price = 1.0
+        else:
+            hist = session.query(FundPriceHistory).filter(FundPriceHistory.isin == isin,
+                                                          FundPriceHistory.date <= date_override).order_by(
+                desc(FundPriceHistory.date)).first()
+            price = hist.close_price if hist else get_latest_price(isin)
+    else:
+        rec_date = datetime.now()
+        price = get_latest_price(isin)
 
     if 'Fund' in strategy_key:
-        units = amount / current_price
+        units = amount / price
     else:
-        units = amount  # 1:1 for cash
-        current_price = 1.0
+        units = amount
+        price = 1.0
 
     rec = FinancialRecord(
-        year=year,
-        amount=amount,
-        allocation_type=strategy_key,
-        isin=isin,
-        entry_price=current_price,
-        units_owned=units,
-        interest_rate_at_time=debt_rate if 'Debt' in strategy_key else 0,
-        risk_score=risk
+        date=rec_date, year=rec_date.year, amount=amount, allocation_type=strategy_key,
+        isin=isin, entry_price=price, units_owned=units,
+        interest_rate_at_time=debt_rate if 'Debt' in strategy_key else 0, risk_score=risk
     )
     session.add(rec)
     session.commit()
 
+
+# --- 3. DATAFRAME GENERATION ---
 
 def get_portfolio_df():
     records = session.query(FinancialRecord).all()
@@ -215,6 +214,12 @@ def get_portfolio_df():
 
         profit = cur_val - r.amount
 
+        # FIX: Calculate Return % safely
+        if r.amount > 0:
+            ret_pct = (profit / r.amount) * 100
+        else:
+            ret_pct = 0.0
+
         # Get Rating
         m_risk = get_fund_rating(r.isin) if 'Fund' in r.allocation_type else 0
 
@@ -227,7 +232,8 @@ def get_portfolio_df():
             "Current Price": current_price,
             "Units": r.units_owned,
             "Current Value": cur_val,
-            "Profit (NOK)": profit,
+            "Profit": profit,
+            "Return (%)": ret_pct,
             "Morningstar Risk": m_risk
         })
     return pd.DataFrame(data)
@@ -306,219 +312,259 @@ def calculate_opportunity_cost(records):
     return total_benefit
 
 
-def plot_fund_performance_with_entries(session, selected_isin):
-    # 1. Fetch Price History
+def plot_fund_performance_with_entries(session, selected_isin, currency_symbol, rate):
+    # 1. Fetch History
     history = session.query(FundPriceHistory).filter_by(isin=selected_isin).order_by(FundPriceHistory.date).all()
-    if not history:
-        return None
+    if not history: return None
 
-    df_hist = pd.DataFrame([{"Date": h.date, "Price": h.close_price, "Fund": h.fund_name} for h in history])
-    fund_name = df_hist['Fund'].iloc[0]
+    # Convert Historical Prices using CURRENT rate
+    df_hist = pd.DataFrame([{"Date": h.date, "Price": h.close_price / rate, "Fund": h.fund_name} for h in history])
 
-    # 2. Fetch Investments for this fund
+    # 2. Fetch Investments
     investments = session.query(FinancialRecord).filter_by(isin=selected_isin).all()
-    df_inv = pd.DataFrame([{"Date": i.date, "Entry Price": i.entry_price, "Amount": i.amount} for i in investments])
+    df_inv = pd.DataFrame([{
+        "Date": i.date,
+        "Entry Price": i.entry_price / rate,
+        "Amount": i.amount / rate
+    } for i in investments])
 
-    # 3. Create the Plot
-    fig = px.line(df_hist, x="Date", y="Price", title=f"Historical Price: {fund_name}")
+    # 3. Build Plot
+    fig = px.line(df_hist, x="Date", y="Price",
+                  title=f"Historical Price: {df_hist['Fund'].iloc[0]} ({currency_symbol})")
 
     if not df_inv.empty:
-        # Add a scatter layer for the entry points
+        # Add Stars with Text Labels
         fig.add_trace(go.Scatter(
             x=df_inv["Date"],
             y=df_inv["Entry Price"],
-            mode='markers+text',
+            mode='markers+text',  # <--- TEXT ENABLED
             name='My Investments',
-            marker=dict(size=12, color='Gold', symbol='star', line=dict(width=2, color='DarkSlateGrey')),
-            text=[f"Investert: {amt:,.0f} NOK" for amt in df_inv["Amount"]],
-            textposition="top center"
+            marker=dict(size=14, color='Gold', symbol='star', line=dict(width=2, color='DarkSlateGrey')),
+            text=[f"Invested {amt:,.0f} {currency_symbol}" for amt in df_inv["Amount"]],  # <--- AMOUNT LABEL
+            textposition="top center",
+            textfont=dict(color='black', size=11)
         ))
 
-    fig.update_layout(hovermode="x unified", template="plotly_white")
+        # --- THE FIX IS ON THIS LINE ---
+        # We add template="plotly_white" to force a light background
+        fig.update_layout(
+            yaxis_title=f"Price ({currency_symbol})",
+            hovermode="x unified",
+            template="plotly_white"
+        )
+
     return fig
 
 
-# --- 5. STREAMLIT FRONTEND ---
+# --- 4. DASHBOARD ---
 
-st.set_page_config(page_title="FinStrat: Real-Time", layout="wide")
-st.title("💰 FinStrat: Real-Time Wealth Manager")
+st.set_page_config(page_title="FinStrat: Global", layout="wide")
+st.title("💰 FinStrat: Global Wealth Manager")
 
-# SIDEBAR: DATA SYNC
-st.sidebar.header("📡 Market Data")
-if st.sidebar.button("🔄 Sync Yahoo Finance Data"):
-    with st.spinner("Connecting to Yahoo Finance..."):
-        count, log = update_database_with_history(session)
-    if count > 0:
-        st.sidebar.success(f"Success! Added {count} new data points.")
-        with st.sidebar.expander("View Log"):
-            st.text(log)
-    else:
-        st.sidebar.info("Data is up to date.")
+# SIDEBAR
+if st.sidebar.button("🔄 Sync Market Data"):
+    with st.spinner("Fetching Yahoo Finance Data..."):
+        c, l = update_database_with_history(session)
+    st.sidebar.success(f"Synced {c} records.")
+
 
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Settings")
-curr_year = datetime.now().year
+# DEFINING THE RATES HERE SO TAB 1 CAN SEE THEM
 d_rate = st.sidebar.number_input("Debt Rate (%)", 5.06)
 m_rate = st.sidebar.number_input("Est. Market Return (%)", 7.00)
 
+st.sidebar.markdown("---")
+st.sidebar.header("🌍 Currency Settings")
+rates = get_exchange_rates()
+view_currency = st.sidebar.radio("Display Currency:", ["NOK (Local)", "EUR (Home)", "USD (Global)"])
+
+# Currency Logic
+if view_currency == "NOK (Local)":
+    rate_div = 1.0
+    curr_sym = "kr"
+elif view_currency == "EUR (Home)":
+    rate_div = rates['EUR']
+    curr_sym = "€"
+else:
+    rate_div = rates['USD']
+    curr_sym = "$"
+
+st.sidebar.caption(f"Exchange Rate: 1 {curr_sym} = {rate_div:.2f} NOK")
+
 # TABS
-tab1, tab2 = st.tabs(["🚀 Strategy & Allocation", "📊 Live Portfolio"])
+tab1, tab2 = st.tabs(["🚀 Strategy Engine", "📊 Portfolio Overview"])
 
 with tab1:
-    st.subheader("🚀 Investment & Simulation")
+    st.subheader("New Cash Allocation")
 
-    # Toggle between Live and Historical
-    mode = st.radio("Select Mode", ["Live Investment (Today)", "Historical Simulation (Backdate)"], horizontal=True)
+    # 1. SETUP: Mode & Amount
+    mode = st.radio("Mode", ["Live (Today)", "Simulation (Backtest)"], horizontal=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
-        new_cash = st.number_input("Amount (NOK)", min_value=0, step=5000)
+        inv_amount_nok = st.number_input("Total Amount to Invest (NOK)", min_value=0.0, step=5000.0, value=0.0)
+
     with col_b:
-        if mode == "Historical Simulation (Backdate)":
-            # Allow user to pick a date from the last 3 years
-            sim_date = st.date_input("Simulation Date",
-                                     value=datetime.now() - timedelta(days=365),
-                                     min_value=datetime.now() - timedelta(days=3 * 365),
-                                     max_value=datetime.now())
-        else:
-            sim_date = datetime.now()
+        sim_date = datetime.now()
+        if mode == "Simulation (Backtest)":
+            sim_date = st.date_input("Simulation Date", value=datetime.now() - timedelta(days=365))
 
-    if new_cash > 0:
-        # 1. Fetch the price for the chosen date
-        st.markdown("---")
-        st.info(f"Analyzing strategy for **{sim_date.strftime('%d %B %Y')}**...")
+    st.markdown("---")
 
-        # Simple Strategy Logic
+    if inv_amount_nok > 0:
+        # 2. AI STRATEGY ENGINE
         real_debt = d_rate * 0.78
         real_mkt = m_rate * 0.62
-        rec_map = {'Global Index Fund': new_cash * 0.75, 'Nordic Fund': new_cash * 0.25} if real_mkt > real_debt else {
-            'Debt Paydown': new_cash}
 
-        for key, val in rec_map.items():
-            details = FUND_MAP.get(key, {})
-            isin_ref = details.get('isin')
+        rec_map = {}
+        strategy_reason = ""
+        risk_score = 0
 
-            # GET HISTORICAL PRICE FOR THAT DATE
-            if 'fixed_price' in details:
-                hist_price = 1.0
+        # Logic: Debt vs Market
+        if real_debt > real_mkt:
+            rec_map = {'Debt Paydown': inv_amount_nok}
+            risk_score = 1
+            strategy_reason = f"📉 **Defensive Strategy:** The after-tax cost of debt ({real_debt:.2f}%) is higher than the expected market return ({real_mkt:.2f}%). Paying down debt is the risk-free winner."
+        else:
+            # Growth Strategy: 70% Global, 20% Nordic, 10% Europe (Example Diversification)
+            rec_map = {
+                'Global Index Fund': inv_amount_nok * 0.70,
+                'Nordic Fund': inv_amount_nok * 0.20,
+                'European Fund': inv_amount_nok * 0.10
+            }
+            risk_score = 4
+            strategy_reason = f"📈 **Growth Strategy:** Market returns ({real_mkt:.2f}%) are expected to beat debt cost ({real_debt:.2f}%). We recommend a diversified equity split."
+
+        # 3. DISPLAY PROPOSAL
+        st.info(strategy_reason)
+
+        # 4. USER CUSTOMIZATION (The "Select & Modify" Section)
+        st.subheader("🛠 Customize & Confirm")
+        st.caption("The values below are pre-filled with the AI recommendation. You can modify them freely.")
+
+        with st.form("allocation_form"):
+            user_allocs = {}
+
+            # Create a 2-column layout for the input fields
+            c1, c2 = st.columns(2)
+            keys = list(FUND_MAP.keys())
+
+            for i, key in enumerate(keys):
+                # Get the recommended amount (0 if not recommended)
+                rec_val = rec_map.get(key, 0.0)
+
+                # Display inputs (Alternating columns)
+                with (c1 if i % 2 == 0 else c2):
+                    user_allocs[key] = st.number_input(
+                        f"{key} (NOK)",
+                        min_value=0.0,
+                        value=float(rec_val),
+                        step=1000.0,
+                        key=f"input_{key}"
+                    )
+
+            # 5. VALIDATION & SUBMIT
+            st.markdown("---")
+            total_user_input = sum(user_allocs.values())
+            diff = inv_amount_nok - total_user_input
+
+            # Dynamic Total Check
+            if abs(diff) > 1.0:  # Tolerance for float rounding
+                st.warning(
+                    f"⚠️ Allocation Mismatch: You have allocated **{total_user_input:,.0f} NOK**. You have **{diff:,.0f} NOK** remaining/overspent.")
+                ready_to_submit = False
             else:
-                # Find the closest price in our database to the sim_date
-                hist_record = session.query(FundPriceHistory).filter(
-                    FundPriceHistory.isin == isin_ref,
-                    FundPriceHistory.date <= sim_date
-                ).order_by(desc(FundPriceHistory.date)).first()
+                st.success(f"✅ Perfect Match: {total_user_input:,.0f} / {inv_amount_nok:,.0f} NOK allocated.")
+                ready_to_submit = True
 
-                hist_price = hist_record.close_price if hist_record else get_latest_price(isin_ref)
+            submitted = st.form_submit_button("Confirm & Log Investment")
 
-            # Display Preview
-            st.write(f"**{key}**")
-            c1, c2, c3 = st.columns(3)
-            c1.caption(f"Price on {sim_date.strftime('%Y-%m-%d')}")
-            c1.write(f"{hist_price:.2f} NOK")
-
-            units = val / hist_price
-            c2.caption("Units Acquired")
-            c2.write(f"{units:.2f}")
-
-            current_price = get_latest_price(isin_ref)
-            growth = ((current_price / hist_price) - 1) * 100
-            c3.caption("Growth Since Then")
-            c3.write(f"{growth:+.2f}%")
-
-        if st.button("Confirm & Add to Portfolio"):
-            for k, v in rec_map.items():
-                details = FUND_MAP.get(k, {})
-                isin_ref = details.get('isin')
-
-                # Fetch price again for saving
-                if 'fixed_price' in details:
-                    price_at_entry = 1.0
+            if submitted:
+                if not ready_to_submit:
+                    st.error("Please adjust the values to match the Total Amount before confirming.")
                 else:
-                    hist_record = session.query(FundPriceHistory).filter(
-                        FundPriceHistory.isin == isin_ref,
-                        FundPriceHistory.date <= sim_date
-                    ).order_by(desc(FundPriceHistory.date)).first()
-                    price_at_entry = hist_record.close_price if hist_record else get_latest_price(isin_ref)
+                    # LOGGING LOGIC
+                    for key, amount in user_allocs.items():
+                        if amount > 0:
+                            # Assign risk based on asset type
+                            final_risk = 4 if 'Fund' in key else (1 if 'Savings' in key or 'Debt' in key else 3)
 
-                # LOG THE RECORD
-                rec = FinancialRecord(
-                    date=datetime.combine(sim_date, datetime.min.time()),
-                    year=sim_date.year,
-                    amount=v,
-                    allocation_type=k,
-                    isin=isin_ref,
-                    entry_price=price_at_entry,
-                    units_owned=v / price_at_entry,
-                    interest_rate_at_time=d_rate,
-                    risk_score=4 if 'Fund' in k else 1
-                )
-                session.add(rec)
-            session.commit()
-            st.success(f"Successfully simulated and added investment from {sim_date.strftime('%Y-%m-%d')}!")
-            st.rerun()
+                            log_investment(
+                                amount=amount,
+                                strategy_key=key,
+                                risk=final_risk,
+                                year=sim_date.year,
+                                debt_rate=d_rate,
+                                date_override=sim_date if mode == "Simulation (Backtest)" else None
+                            )
+
+                    st.toast("Investment Logged Successfully!", icon="🎉")
+                    st.rerun()
 
 with tab2:
-    st.subheader("Live Portfolio Valuation")
+    st.subheader(f"Portfolio Valuation ({view_currency})")
     df = get_portfolio_df()
 
     if not df.empty:
-        # Summary Metrics
-        total_inv = df['Invested'].sum()
-        total_val = df['Current Value'].sum()
-        total_pl = total_val - total_inv
-        roi = (total_pl / total_inv) * 100 if total_inv > 0 else 0
+        # CONVERT DATA FOR DISPLAY
+        df_disp = df.copy()
+        cols_money = ['Invested', 'Current Value', 'Profit', 'Entry Price', 'Current Price']
+        for c in cols_money:
+            df_disp[c] = df_disp[c] / rate_div
+
+        # Metrics
+        tot_inv = df_disp['Invested'].sum()
+        tot_val = df_disp['Current Value'].sum()
+        tot_pl = tot_val - tot_inv
+        roi = (tot_pl / tot_inv) * 100 if tot_inv else 0
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Invested Capital", f"{total_inv:,.0f} NOK")
-        m2.metric("Current Value", f"{total_val:,.0f} NOK", delta=f"{total_pl:,.0f} NOK")
+        m1.metric("Invested Capital", f"{curr_sym} {tot_inv:,.0f}")
+        m2.metric("Current Value", f"{curr_sym} {tot_val:,.0f}", delta=f"{tot_pl:,.0f}")
         m3.metric("Total ROI", f"{roi:.2f}%")
-
-        # Weighted Risk Score
-        avg_risk = df[df['Morningstar Risk'] > 0]['Morningstar Risk'].mean()
-        m4.metric("Avg Fund Risk Rating", f"{avg_risk:.1f}" if pd.notna(avg_risk) else "N/A")
+        m4.metric("Avg Risk", f"{df_disp[df_disp['Morningstar Risk'] > 0]['Morningstar Risk'].mean():.1f}")
 
         st.markdown("---")
 
-        # --- NEW: HISTORICAL CHART WITH ENTRY MARKS ---
-        st.markdown("### 📈 Historical Context & Entry Points")
-
-        # Filter funds that have an ISIN
-        available_funds = df[df['ISIN'].str.len() >= 10]['Allocation'].unique()
-
-        if len(available_funds) > 0:
-            selected_fund_name = st.selectbox("Select fund to view history", available_funds)
-            target_isin = FUND_MAP[selected_fund_name]['isin']
-
-            # Generate the specific plot
-            import plotly.graph_objects as go  # Ensure this is imported at top
-
-            fig_hist = plot_fund_performance_with_entries(session, target_isin)
-
-            if fig_hist:
-                st.plotly_chart(fig_hist, use_container_width=True)
-                st.caption("The stars indicate the exact date and price at which you deployed capital.")
+        # PLOT 1: HISTORICAL (WITH STARS & LABELS)
+        funds = df[df['ISIN'].str.len() > 8]['Allocation'].unique()
+        if len(funds) > 0:
+            sel_fund = st.selectbox("Select Asset History", funds)
+            target_isin = FUND_MAP[sel_fund]['isin']
+            # Calls the UPDATED function with text labels
+            fig_hist = plot_fund_performance_with_entries(session, target_isin, curr_sym, rate_div)
+            if fig_hist: st.plotly_chart(fig_hist, use_container_width=True)
 
         st.markdown("---")
 
-        # Detailed Table
-        st.dataframe(df.style.format({
-            "Invested": "{:,.0f}",
-            "Current Value": "{:,.0f}",
-            "Profit (NOK)": "{:,.0f}",
-            "Return (%)": "{:.2f}",
-            "Current Price": "{:.2f}"
-        }))
-
-        # Visuals
+        # PLOT 2 & 3: PIE CHART AND BAR CHART
         c1, c2 = st.columns(2)
+
         with c1:
-            st.markdown("#### Allocation Breakdown")
-            fig_pie = px.pie(df, values='Current Value', names='Allocation', hole=0.4)
+            st.markdown("#### Asset Allocation")
+            # --- RESTORED PIE CHART ---
+            fig_pie = px.pie(df_disp, values='Current Value', names='Allocation', hole=0.4,
+                             color_discrete_sequence=px.colors.sequential.RdBu)
+            fig_pie.update_traces(textinfo='percent+label')
             st.plotly_chart(fig_pie, use_container_width=True)
+
         with c2:
             st.markdown("#### Performance by Asset")
-            fig_bar = px.bar(df, x='Allocation', y=['Invested', 'Current Value'], barmode='group')
+            fig_bar = px.bar(df_disp, x='Allocation', y=['Invested', 'Current Value'], barmode='group',
+                             labels={'value': f'Amount ({curr_sym})', 'variable': 'Metric'})
+            fig_bar.update_layout(yaxis_title=f"Value ({curr_sym})", legend_title_text='')
             st.plotly_chart(fig_bar, use_container_width=True)
 
+        # DETAILED TABLE
+        st.markdown("#### Holding Details")
+        st.dataframe(df_disp[['Allocation', 'Date', 'Invested', 'Current Value', 'Profit', 'Return (%)']]
+        .style.format({
+            'Invested': f"{curr_sym} {{:,.0f}}",
+            'Current Value': f"{curr_sym} {{:,.0f}}",
+            'Profit': f"{curr_sym} {{:,.0f}}",
+            'Return (%)': "{:.2f}%"
+        }))
+
     else:
-        st.info("No active investments found. Go to the 'Strategy' tab to add funds.")
+        st.info("No investments found.")

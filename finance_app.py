@@ -306,6 +306,38 @@ def calculate_opportunity_cost(records):
     return total_benefit
 
 
+def plot_fund_performance_with_entries(session, selected_isin):
+    # 1. Fetch Price History
+    history = session.query(FundPriceHistory).filter_by(isin=selected_isin).order_by(FundPriceHistory.date).all()
+    if not history:
+        return None
+
+    df_hist = pd.DataFrame([{"Date": h.date, "Price": h.close_price, "Fund": h.fund_name} for h in history])
+    fund_name = df_hist['Fund'].iloc[0]
+
+    # 2. Fetch Investments for this fund
+    investments = session.query(FinancialRecord).filter_by(isin=selected_isin).all()
+    df_inv = pd.DataFrame([{"Date": i.date, "Entry Price": i.entry_price, "Amount": i.amount} for i in investments])
+
+    # 3. Create the Plot
+    fig = px.line(df_hist, x="Date", y="Price", title=f"Historical Price: {fund_name}")
+
+    if not df_inv.empty:
+        # Add a scatter layer for the entry points
+        fig.add_trace(go.Scatter(
+            x=df_inv["Date"],
+            y=df_inv["Entry Price"],
+            mode='markers+text',
+            name='My Investments',
+            marker=dict(size=12, color='Gold', symbol='star', line=dict(width=2, color='DarkSlateGrey')),
+            text=[f"Investert: {amt:,.0f} NOK" for amt in df_inv["Amount"]],
+            textposition="top center"
+        ))
+
+    fig.update_layout(hovermode="x unified", template="plotly_white")
+    return fig
+
+
 # --- 5. STREAMLIT FRONTEND ---
 
 st.set_page_config(page_title="FinStrat: Real-Time", layout="wide")
@@ -333,45 +365,96 @@ m_rate = st.sidebar.number_input("Est. Market Return (%)", 7.00)
 tab1, tab2 = st.tabs(["🚀 Strategy & Allocation", "📊 Live Portfolio"])
 
 with tab1:
-    st.subheader("New Cash Allocation")
-    new_cash = st.number_input("Amount to Invest (NOK)", min_value=0, step=5000)
+    st.subheader("🚀 Investment & Simulation")
+
+    # Toggle between Live and Historical
+    mode = st.radio("Select Mode", ["Live Investment (Today)", "Historical Simulation (Backdate)"], horizontal=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        new_cash = st.number_input("Amount (NOK)", min_value=0, step=5000)
+    with col_b:
+        if mode == "Historical Simulation (Backdate)":
+            # Allow user to pick a date from the last 3 years
+            sim_date = st.date_input("Simulation Date",
+                                     value=datetime.now() - timedelta(days=365),
+                                     min_value=datetime.now() - timedelta(days=3 * 365),
+                                     max_value=datetime.now())
+        else:
+            sim_date = datetime.now()
 
     if new_cash > 0:
-        # STRATEGY LOGIC
+        # 1. Fetch the price for the chosen date
+        st.markdown("---")
+        st.info(f"Analyzing strategy for **{sim_date.strftime('%d %B %Y')}**...")
+
+        # Simple Strategy Logic
         real_debt = d_rate * 0.78
         real_mkt = m_rate * 0.62
+        rec_map = {'Global Index Fund': new_cash * 0.75, 'Nordic Fund': new_cash * 0.25} if real_mkt > real_debt else {
+            'Debt Paydown': new_cash}
 
-        # Recommendation
-        if real_debt > real_mkt:
-            rec_map = {'Debt Paydown': new_cash}
-            risk_score = 1
-            st.warning(f"📉 Strategy: Pay Debt (Rate {d_rate}% is high).")
-        else:
-            rec_map = {'Global Index Fund': new_cash * 0.75, 'Nordic Fund': new_cash * 0.25}
-            risk_score = 4
-            st.success("📈 Strategy: Growth (Market expected to beat Debt).")
+        for key, val in rec_map.items():
+            details = FUND_MAP.get(key, {})
+            isin_ref = details.get('isin')
 
-        # Display Plan
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            st.markdown("### Proposed Split")
-            for key, val in rec_map.items():
-                details = FUND_MAP.get(key, {})
-                isin_ref = details.get('isin')
-                price = get_latest_price(isin_ref)
-                st.info(f"**{key}**: {val:,.0f} NOK  \n*Fund: {details.get('name')} (Price: {price:.2f})*")
+            # GET HISTORICAL PRICE FOR THAT DATE
+            if 'fixed_price' in details:
+                hist_price = 1.0
+            else:
+                # Find the closest price in our database to the sim_date
+                hist_record = session.query(FundPriceHistory).filter(
+                    FundPriceHistory.isin == isin_ref,
+                    FundPriceHistory.date <= sim_date
+                ).order_by(desc(FundPriceHistory.date)).first()
 
-        with col2:
-            st.markdown("### Risk Analysis")
-            st.metric("Strategy Risk", f"{risk_score}/5")
-            if 'Global Index Fund' in rec_map:
-                m_risk = get_fund_rating(FUND_MAP['Global Index Fund']['isin'])
-                st.metric("Morningstar Risk Rating", f"{m_risk:.0f} / 7")
+                hist_price = hist_record.close_price if hist_record else get_latest_price(isin_ref)
 
-        if st.button("Confirm & Invest"):
+            # Display Preview
+            st.write(f"**{key}**")
+            c1, c2, c3 = st.columns(3)
+            c1.caption(f"Price on {sim_date.strftime('%Y-%m-%d')}")
+            c1.write(f"{hist_price:.2f} NOK")
+
+            units = val / hist_price
+            c2.caption("Units Acquired")
+            c2.write(f"{units:.2f}")
+
+            current_price = get_latest_price(isin_ref)
+            growth = ((current_price / hist_price) - 1) * 100
+            c3.caption("Growth Since Then")
+            c3.write(f"{growth:+.2f}%")
+
+        if st.button("Confirm & Add to Portfolio"):
             for k, v in rec_map.items():
-                log_investment(v, k, risk_score, curr_year, d_rate)
-            st.success("Investment logged successfully!")
+                details = FUND_MAP.get(k, {})
+                isin_ref = details.get('isin')
+
+                # Fetch price again for saving
+                if 'fixed_price' in details:
+                    price_at_entry = 1.0
+                else:
+                    hist_record = session.query(FundPriceHistory).filter(
+                        FundPriceHistory.isin == isin_ref,
+                        FundPriceHistory.date <= sim_date
+                    ).order_by(desc(FundPriceHistory.date)).first()
+                    price_at_entry = hist_record.close_price if hist_record else get_latest_price(isin_ref)
+
+                # LOG THE RECORD
+                rec = FinancialRecord(
+                    date=datetime.combine(sim_date, datetime.min.time()),
+                    year=sim_date.year,
+                    amount=v,
+                    allocation_type=k,
+                    isin=isin_ref,
+                    entry_price=price_at_entry,
+                    units_owned=v / price_at_entry,
+                    interest_rate_at_time=d_rate,
+                    risk_score=4 if 'Fund' in k else 1
+                )
+                session.add(rec)
+            session.commit()
+            st.success(f"Successfully simulated and added investment from {sim_date.strftime('%Y-%m-%d')}!")
             st.rerun()
 
 with tab2:
@@ -393,6 +476,27 @@ with tab2:
         # Weighted Risk Score
         avg_risk = df[df['Morningstar Risk'] > 0]['Morningstar Risk'].mean()
         m4.metric("Avg Fund Risk Rating", f"{avg_risk:.1f}" if pd.notna(avg_risk) else "N/A")
+
+        st.markdown("---")
+
+        # --- NEW: HISTORICAL CHART WITH ENTRY MARKS ---
+        st.markdown("### 📈 Historical Context & Entry Points")
+
+        # Filter funds that have an ISIN
+        available_funds = df[df['ISIN'].str.len() >= 10]['Allocation'].unique()
+
+        if len(available_funds) > 0:
+            selected_fund_name = st.selectbox("Select fund to view history", available_funds)
+            target_isin = FUND_MAP[selected_fund_name]['isin']
+
+            # Generate the specific plot
+            import plotly.graph_objects as go  # Ensure this is imported at top
+
+            fig_hist = plot_fund_performance_with_entries(session, target_isin)
+
+            if fig_hist:
+                st.plotly_chart(fig_hist, use_container_width=True)
+                st.caption("The stars indicate the exact date and price at which you deployed capital.")
 
         st.markdown("---")
 

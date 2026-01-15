@@ -4,27 +4,61 @@ import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
 import json
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, desc, Text
+import hashlib
+import google.generativeai as genai
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, desc, Text, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
 
-# --- 1. DATABASE SETUP ---
+# ==========================================
+# 🧠 AI AGENT CONFIGURATION
+# ==========================================
+SYSTEM_PROMPT_TEMPLATE = """
+You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-efficient portfolio construction for retail investors.
+
+**User Profile:**
+- **Tax Residence:** {tax_residence}
+- **Investment Amount:** {amount} {currency}
+- **Risk Profile:** {risk_profile}
+
+**Tax Rules to Apply:**
+1. **Norway:** Prioritize 'Aksjesparekonto' (ASK) eligible funds (EEA/EU domiciled).
+2. **France:** Prioritize 'PEA' eligible funds (European equities).
+3. **USA:** Avoid PFIC (Foreign Mutual Funds), favor US-domiciled ETFs.
+
+**Available Funds (User's Universe):**
+{fund_list_json}
+
+**Your Mission:**
+Allocate the cash into the "Available Funds" to create an optimal portfolio based on the tax rules and risk profile.
+- You must ONLY use the funds provided in the list.
+- You can suggest allocations to "BANK" (savings) or "DEBT" (paydown) if needed.
+- If the universe is poor, suggest the best available option and suggest adding better funds available in that tax jurisdiction.
+- Provide a diversified allocation that balances risk and tax efficiency.
+- Your reasoning should reflect tax optimization and risk management with a focus on the user's profile.
+- Consider the user as a newby investor with no prior holdings.
+
+**Output Format:**
+Respond with a strict JSON object (no markdown):
+{{
+  "allocations": {{ "ISIN_CODE_1": AMOUNT_NUMBER, "ISIN_CODE_2": AMOUNT_NUMBER }},
+  "reasoning": "One sentence explaining the tax/risk logic used."
+}}
+"""
+
+# ==========================================
+# 1. DATABASE SETUP
+# ==========================================
 Base = declarative_base()
-engine = create_engine('sqlite:///personal_finance_v6.db', echo=False)
+engine = create_engine('sqlite:///personal_finance_v11_optimized.db', echo=False)
 
 
-class FinancialRecord(Base):
-    __tablename__ = 'financial_records'
+class User(Base):
+    __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    date = Column(DateTime, default=datetime.now)
-    year = Column(Integer)
-    amount = Column(Float)
-    allocation_type = Column(String)
-    isin = Column(String, nullable=True)
-    entry_price = Column(Float, nullable=True)
-    units_owned = Column(Float, nullable=True)
-    interest_rate_at_time = Column(Float)
-    risk_score = Column(Integer)
+    username = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    tax_residences = Column(String, default="Norway")
 
 
 class FundProfile(Base):
@@ -36,6 +70,29 @@ class FundProfile(Base):
     top_holdings = Column(Text)
     sector_info = Column(Text)
     category = Column(String)
+    region = Column(String, default="Global")
+
+
+class UserFundSelection(Base):
+    __tablename__ = 'user_fund_selections'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    isin = Column(String, ForeignKey('fund_profiles.isin'))
+
+
+class FinancialRecord(Base):
+    __tablename__ = 'financial_records'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    date = Column(DateTime, default=datetime.now)
+    year = Column(Integer)
+    amount = Column(Float)
+    allocation_type = Column(String)
+    isin = Column(String, nullable=True)
+    entry_price = Column(Float, nullable=True)
+    units_owned = Column(Float, nullable=True)
+    interest_rate_at_time = Column(Float)
+    risk_score = Column(Integer)
 
 
 class FundPriceHistory(Base):
@@ -51,62 +108,166 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 session = Session()
 
-# --- 2. CONFIGURATION ---
+# ==========================================
+# 2. SUGGESTED FUNDS
+# ==========================================
 SUGGESTED_FUNDS = [
-    {"ticker": "EQQQ.PA", "cat": "Tech", "name": "Invesco Nasdaq-100 ETF"},
-    {"ticker": "SPY", "cat": "Global", "name": "SPDR S&P 500 ETF"},
-    {"ticker": "ICLN", "cat": "Energy", "name": "iShares Global Clean Energy"},
-    {"ticker": "EQNR.OL", "cat": "Norwegian", "name": "Equinor ASA (Energy)"},
-    {"ticker": "DNB.OL", "cat": "Norwegian", "name": "DNB Bank ASA"},
-    {"ticker": "MOWI.OL", "cat": "Norwegian", "name": "Mowi ASA (Seafood)"},
-    {"ticker": "EUNL.DE", "cat": "Global", "name": "iShares Core MSCI World"}
+    {"ticker": "SPY", "cat": "Global", "name": "SPDR S&P 500 ETF (US)", "countries": ["USA", "Global"]},
+    {"ticker": "QQQ", "cat": "Tech", "name": "Invesco QQQ (Nasdaq-100)", "countries": ["USA", "Global"]},
+    {"ticker": "VT", "cat": "Global", "name": "Vanguard Total World Stock", "countries": ["USA", "Global"]},
+    {"ticker": "DNB.OL", "cat": "Norwegian", "name": "DNB Bank ASA", "countries": ["Norway"]},
+    {"ticker": "EQNR.OL", "cat": "Energy", "name": "Equinor ASA", "countries": ["Norway"]},
+    {"ticker": "MOWI.OL", "cat": "Seafood", "name": "Mowi ASA", "countries": ["Norway"]},
+    {"ticker": "YAR.OL", "cat": "Materials", "name": "Yara International", "countries": ["Norway"]},
+    {"ticker": "KOG.OL", "cat": "Defense", "name": "Kongsberg Gruppen", "countries": ["Norway"]},
+    {"ticker": "ORK.OL", "cat": "Consumer", "name": "Orkla ASA", "countries": ["Norway"]},
+    {"ticker": "CW8.PA", "cat": "Global", "name": "Amundi MSCI World (PEA)", "countries": ["France"]},
+    {"ticker": "ESE.PA", "cat": "Global", "name": "BNP Paribas S&P 500 (PEA)", "countries": ["France"]},
+    {"ticker": "TTE.PA", "cat": "Energy", "name": "TotalEnergies SE", "countries": ["France"]},
+    {"ticker": "MC.PA", "cat": "Luxury", "name": "LVMH Moët Hennessy", "countries": ["France"]},
+    {"ticker": "AI.PA", "cat": "Materials", "name": "Air Liquide", "countries": ["France"]},
+    {"ticker": "OR.PA", "cat": "Beauty", "name": "L'Oréal", "countries": ["France"]},
+    {"ticker": "EUNL.DE", "cat": "Global", "name": "iShares Core MSCI World (UCITS)",
+     "countries": ["Germany", "Norway", "Sweden", "Denmark"]},
+    {"ticker": "SAP.DE", "cat": "Tech", "name": "SAP SE", "countries": ["Germany"]},
+    {"ticker": "SIE.DE", "cat": "Industrial", "name": "Siemens AG", "countries": ["Germany"]},
+    {"ticker": "INVE-B.ST", "cat": "Finance", "name": "Investor AB", "countries": ["Sweden"]},
+    {"ticker": "VOLV-B.ST", "cat": "Industrial", "name": "Volvo AB", "countries": ["Sweden"]},
+    {"ticker": "ATCO-A.ST", "cat": "Industrial", "name": "Atlas Copco", "countries": ["Sweden"]},
+    {"ticker": "NOVO-B.CO", "cat": "Health", "name": "Novo Nordisk", "countries": ["Denmark", "Global"]},
+    {"ticker": "DSV.CO", "cat": "Logistics", "name": "DSV A/S", "countries": ["Denmark"]},
+    {"ticker": "HSBA.L", "cat": "Finance", "name": "HSBC Holdings", "countries": ["UK"]},
+    {"ticker": "AZN.L", "cat": "Health", "name": "AstraZeneca", "countries": ["UK"]},
 ]
 
 
-# --- 3. LOGIC FUNCTIONS ---
-def fetch_and_save_fund_profile(ticker_symbol, category_tag="Custom"):
+# ==========================================
+# 3. STRATEGY AGENT
+# ==========================================
+class StrategyAgent:
+    def __init__(self, api_key):
+        self.api_key = api_key
+
+    def get_allocation(self, user_profile, funds, amount):
+        funds_context = []
+        for f in funds:
+            funds_context.append({
+                "isin": f.isin, "name": f.name, "region": f.region,
+                "category": f.category
+            })
+
+        prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            tax_residence=user_profile['tax_residence'],
+            amount=amount,
+            currency="NOK",
+            risk_profile=user_profile.get('risk', 'Growth'),
+            fund_list_json=json.dumps(funds_context, indent=2)
+        )
+
+        if not self.api_key:
+            return {}, "⚠️ No API Key provided. Please enter your Google Gemini Key in the sidebar."
+
+        try:
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            response = model.generate_content(prompt)
+            clean_text = response.text.replace("```json", "").replace("```", "").strip()
+            result = json.loads(clean_text)
+            return result.get('allocations', {}), result.get('reasoning', "AI provided no reasoning.")
+
+        except Exception as e:
+            return {}, f"AI Error: {str(e)}"
+
+
+# ==========================================
+# 4. CORE LOGIC & HELPERS
+# ==========================================
+def make_hash(p): return hashlib.sha256(str.encode(p)).hexdigest()
+
+
+def check_login(u, p): return session.query(User).filter_by(username=u, password_hash=make_hash(p)).first()
+
+
+def get_user_by_id(uid): return session.query(User).filter_by(id=uid).first()
+
+
+def register_user(u, p, c):
+    if session.query(User).filter_by(username=u).first(): return False, "User exists."
+    session.add(User(username=u, password_hash=make_hash(p), tax_residences=",".join(c)))
+    session.commit()
+    fetch_and_save_fund_profile("0P00018V9L.IR", "Global")
+    return True, "Created."
+
+
+def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        isin = info.get('isin', ticker_symbol)
-        name = info.get('longName', info.get('shortName', ticker_symbol))
-        desc = info.get('longBusinessSummary', 'No description available.')
-        holdings, sectors = [], []
-        if 'sectorWeightings' in info:
-            for s in info['sectorWeightings'][:3]:
-                for k, v in s.items(): sectors.append(f"{k}: {v * 100:.1f}%")
-        profile = FundProfile(isin=isin, ticker=ticker_symbol, name=name, description=desc,
-                              top_holdings=json.dumps(holdings), sector_info=json.dumps(sectors), category=category_tag)
-        session.merge(profile)
+        t = yf.Ticker(ticker)
+        i = t.info
+        isin = i.get('isin', ticker)
+        name = i.get('longName', ticker)
+        reg = "Global"
+        if any(x in ticker for x in [".OL", ".PA", ".DE", ".CO"]): reg = "EEA"
+        if "US" in isin: reg = "US"
+        prof = FundProfile(isin=isin, ticker=ticker, name=name, category=cat, region=reg)
+        session.merge(prof)
         session.commit()
+        if user_id:
+            if not session.query(UserFundSelection).filter_by(user_id=user_id, isin=isin).first():
+                session.add(UserFundSelection(user_id=user_id, isin=isin))
+                session.commit()
         return isin, name
-    except Exception as e:
-        return None, str(e)
+    except:
+        return None, "Error"
 
 
 def update_price_history(isin):
-    profile = session.query(FundProfile).filter_by(isin=isin).first()
-    if not profile: return
-    ticker = yf.Ticker(profile.ticker)
-    end = datetime.now()
-    start = end - timedelta(days=3 * 365)
-    hist = ticker.history(start=start, end=end)
-    risk = ticker.info.get('morningStarRiskRating', 0.0)
-    for date, row in hist.iterrows():
-        if not session.query(FundPriceHistory).filter_by(isin=isin, date=date).first():
-            session.add(FundPriceHistory(isin=isin, date=date, close_price=row['Close'], risk_rating=risk))
+    p = session.query(FundProfile).filter_by(isin=isin).first()
+    if not p: return
+    try:
+        hist = yf.Ticker(p.ticker).history(period="1mo")
+        if not hist.empty:
+            for date, row in hist.iterrows():
+                if not session.query(FundPriceHistory).filter_by(isin=isin, date=date).first():
+                    session.add(FundPriceHistory(isin=isin, date=date, close_price=row['Close']))
+            session.commit()
+    except:
+        pass
+
+
+def get_latest_price(isin):
+    rec = session.query(FundPriceHistory).filter_by(isin=isin).order_by(desc(FundPriceHistory.date)).first()
+    return rec.close_price if rec else 1.0
+
+
+def log_investment(user_id, amount, isin, alloc_type, risk, date_override=None):
+    d = datetime.combine(date_override, datetime.min.time()) if date_override else datetime.now()
+    p = 1.0
+    if isin not in ['BANK', 'DEBT']:
+        if not date_override: update_price_history(isin)
+        p = get_latest_price(isin)
+
+    session.add(
+        FinancialRecord(user_id=user_id, date=d, year=d.year, amount=amount, allocation_type=alloc_type, isin=isin,
+                        entry_price=p, units_owned=amount / p, risk_score=risk))
     session.commit()
 
 
-def init_defaults():
-    if not session.query(FundProfile).first():
-        defaults = [("0P00018V9L.IR", "Global"), ("0P0001CTL0.IR", "Nordic"), ("0P00016TML.IR", "European")]
-        for t, c in defaults:
-            isin, _ = fetch_and_save_fund_profile(t, c)
-            if isin: update_price_history(isin)
-
-
-init_defaults()
+def get_portfolio_df(user_id):
+    recs = session.query(FinancialRecord).filter_by(user_id=user_id).all()
+    data = []
+    for r in recs:
+        p = 1.0
+        name = r.allocation_type
+        if r.isin not in ['BANK', 'DEBT']:
+            p = get_latest_price(r.isin)
+            prof = session.query(FundProfile).filter_by(isin=r.isin).first()
+            if prof: name = prof.name
+        data.append({
+            "Allocation": name, "ISIN": r.isin, "Date": r.date.date(),
+            "Invested": r.amount, "Current Value": r.units_owned * p,
+            "Profit": (r.units_owned * p) - r.amount, "Entry Price": r.entry_price
+        })
+    return pd.DataFrame(data)
 
 
 def get_exchange_rates():
@@ -118,250 +279,280 @@ def get_exchange_rates():
         return {'EUR': 11.5, 'USD': 10.5}
 
 
-def get_latest_price(isin):
-    rec = session.query(FundPriceHistory).filter_by(isin=isin).order_by(desc(FundPriceHistory.date)).first()
-    return rec.close_price if rec else 1.0
-
-
-def log_investment(amount, isin, alloc_type, risk, date_override=None, d_rate=0):
-    rec_date = datetime.now()
-    if date_override: rec_date = datetime.combine(date_override, datetime.min.time())
-
-    price = 1.0
-    if isin not in ['BANK', 'DEBT']:
-        hist = session.query(FundPriceHistory).filter(FundPriceHistory.isin == isin,
-                                                      FundPriceHistory.date <= rec_date).order_by(
-            desc(FundPriceHistory.date)).first()
-        price = hist.close_price if hist else get_latest_price(isin)
-        if price == 1.0:  # Fallback update
-            update_price_history(isin)
-            price = get_latest_price(isin)
-
-    units = amount / price
-    rec = FinancialRecord(
-        date=rec_date, year=rec_date.year, amount=amount, allocation_type=alloc_type,
-        isin=isin, entry_price=price, units_owned=units,
-        interest_rate_at_time=d_rate, risk_score=risk
-    )
-    session.add(rec)
-    session.commit()
-
-
-def get_portfolio_df():
-    records = session.query(FinancialRecord).all()
-    data = []
-    for r in records:
-        curr_price = 1.0
-        if r.isin not in ['BANK', 'DEBT']: curr_price = get_latest_price(r.isin)
-        cur_val = r.units_owned * curr_price
-        prof = cur_val - r.amount
-        ret = (prof / r.amount) * 100 if r.amount > 0 else 0
-        name = r.allocation_type
-        if r.isin not in ['BANK', 'DEBT']:
-            prof_db = session.query(FundProfile).filter_by(isin=r.isin).first()
-            if prof_db: name = prof_db.name
-        data.append({
-            "Allocation": name, "ISIN": r.isin, "Date": r.date.date(),
-            "Invested": r.amount, "Current Value": cur_val, "Profit": prof, "Return (%)": ret,
-            "Entry Price": r.entry_price
-        })
-    return pd.DataFrame(data)
-
-
-def plot_history(session, isin, currency_sym, rate):
+def plot_history(session, user_id, isin, currency_sym, rate):
     hist = session.query(FundPriceHistory).filter_by(isin=isin).order_by(FundPriceHistory.date).all()
     if not hist: return None
     prof = session.query(FundProfile).filter_by(isin=isin).first()
     name = prof.name if prof else isin
     df_h = pd.DataFrame([{"Date": h.date, "Price": h.close_price / rate} for h in hist])
-    investments = session.query(FinancialRecord).filter_by(isin=isin).all()
+    investments = session.query(FinancialRecord).filter_by(isin=isin, user_id=user_id).all()
     df_inv = pd.DataFrame(
         [{"Date": i.date, "Price": i.entry_price / rate, "Amt": i.amount / rate} for i in investments])
 
     fig = px.line(df_h, x="Date", y="Price", title=f"{name} ({currency_sym})")
     if not df_inv.empty:
         fig.add_trace(go.Scatter(
-            x=df_inv["Date"], y=df_inv["Price"], mode='markers+text',
+            x=df_inv["Date"], y=df_inv["Price"], mode='markers+text', name='My Investments',
             marker=dict(size=14, color='Gold', symbol='star', line=dict(width=2, color='DarkSlateGrey')),
             text=[f"{a:,.0f}{currency_sym}" for a in df_inv["Amt"]], textposition="top center",
-            textfont=dict(color='black')
+            textfont=dict(color='white')
         ))
     fig.update_layout(template="plotly_white")
     return fig
 
 
-# --- 4. DASHBOARD UI ---
-st.set_page_config(page_title="FinStrat Pro", layout="wide")
-st.title("💰 FinStrat: Dynamic Wealth Manager")
+# ==========================================
+# 5. MAIN UI
+# ==========================================
+st.set_page_config(page_title="FinStrat AI", layout="wide")
 
-# SIDEBAR
-st.sidebar.header("🌍 Settings")
-rates = get_exchange_rates()
-curr_opt = st.sidebar.radio("Currency", ["NOK", "EUR", "USD"])
-if curr_opt == "NOK":
-    rate = 1.0; sym = "kr"
-elif curr_opt == "EUR":
-    rate = rates['EUR']; sym = "€"
+# --- AUTO-LOGIN LOGIC (PERSISTENCE) ---
+if 'user_id' not in st.session_state: st.session_state.user_id = None
+
+# Check for query param if session is empty
+if st.session_state.user_id is None:
+    # Use st.query_params (standard in newer Streamlit)
+    params = st.query_params
+    if "uid" in params:
+        try:
+            uid = int(params["uid"])
+            user = get_user_by_id(uid)
+            if user:
+                st.session_state.user_id = user.id
+                st.session_state.residences = user.tax_residences
+                st.session_state.username = user.username
+        except:
+            pass
+
+# --- AUTH SCREEN ---
+if not st.session_state.user_id:
+    st.title("🤖 FinStrat AI: Agent Login")
+    t1, t2 = st.tabs(["Login", "Register"])
+    with t1:
+        with st.form("l"):
+            u, p = st.text_input("User"), st.text_input("Pass", type="password")
+            if st.form_submit_button("Go"):
+                user = check_login(u, p)
+                if user:
+                    st.session_state.user_id = user.id
+                    st.session_state.residences = user.tax_residences
+                    st.session_state.username = user.username
+                    # SET QUERY PARAM FOR PERSISTENCE
+                    st.query_params["uid"] = str(user.id)
+                    st.rerun()
+    # with t2:
+    #     with st.form("r"):
+    #         nu, np = st.text_input("User"), st.text_input("Pass", type="password")
+    #         ct = st.multiselect("Tax", ["Norway", "France", "USA", "Germany", "Sweden"])
+    #         if st.form_submit_button("Create"):
+    #             register_user(nu, np, ct)
+    #             st.success("Done")
+
+    st.divider()
+    # if st.button("RESET DATABASE"):
+    #     Base.metadata.drop_all(engine);
+    #     Base.metadata.create_all(engine);
+    #     st.success("Reset!");
+    #     st.rerun()
+
 else:
-    rate = rates['USD']; sym = "$"
+    # --- DASHBOARD ---
+    st.sidebar.title(f"👤 {st.session_state.username}")
+    st.sidebar.info(f"Tax: {st.session_state.residences}")
 
-st.sidebar.markdown("---")
-st.sidebar.header("⚠️ Reset Data")
-if st.sidebar.button("RESET ALL INVESTMENTS"):
-    try:
-        session.query(FinancialRecord).delete()
-        session.commit()
-        st.sidebar.error("Deleted! Start fresh.")
+    if st.sidebar.button("Logout"):
+        st.session_state.user_id = None
+        st.query_params.clear()  # Clear persistence
         st.rerun()
-    except Exception as e:
-        st.sidebar.error(str(e))
 
-st.sidebar.markdown("---")
-st.sidebar.header("📥 Fund Discovery")
-import_mode = st.sidebar.selectbox("Add Funds via:", ["Quick Recommendations", "Manual Ticker Search"])
-if import_mode == "Quick Recommendations":
-    for fund in SUGGESTED_FUNDS:
-        exists = session.query(FundProfile).filter_by(ticker=fund['ticker']).first()
-        col1, col2 = st.sidebar.columns([3, 1])
-        col1.text(fund['name'])
-        if not exists:
-            if col2.button("Add", key=fund['ticker']):
-                with st.spinner("Fetching..."):
-                    isin, res = fetch_and_save_fund_profile(fund['ticker'], fund['cat'])
-                    if isin:
-                        update_price_history(isin)
-                        st.sidebar.success("Added!")
-                        st.rerun()
+    # API KEY
+    st.sidebar.markdown("---")
+    gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password", help="Get key from aistudio.google.com")
+
+
+    # PRICE UPDATES
+    st.sidebar.markdown("---")
+    st.sidebar.header("🔄 Price Updates")
+    user_links = session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id).all()
+    user_fund_isins = [l.isin for l in user_links]
+
+    if user_fund_isins:
+        fund_map = {f.isin: f.name for f in
+                    session.query(FundProfile).filter(FundProfile.isin.in_(user_fund_isins)).all()}
+        selected_update = st.sidebar.multiselect("Select Funds:", user_fund_isins,
+                                                 format_func=lambda x: fund_map.get(x, x), default=user_fund_isins)
+        if st.sidebar.button("Update Selected Prices"):
+            if not selected_update:
+                st.sidebar.error("None selected.")
+            else:
+                progress = st.sidebar.progress(0)
+                for i, isin_code in enumerate(selected_update):
+                    update_price_history(isin_code)
+                    progress.progress((i + 1) / len(selected_update))
+                st.sidebar.success("Prices Updated!")
+                st.rerun()
+    else:
+        st.sidebar.info("Add funds to enable updates.")
+
+    # ADD FUNDS
+    st.sidebar.markdown("---")
+    st.sidebar.header("Universe Builder")
+    user_res = st.session_state.residences
+    filtered_suggestions = [f for f in SUGGESTED_FUNDS if
+                            "Global" in f['countries'] or any(c in user_res for c in f['countries'])]
+
+    for f in filtered_suggestions:
+        prof = session.query(FundProfile).filter_by(ticker=f['ticker']).first()
+        is_linked = False
+        if prof and session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id,
+                                                               isin=prof.isin).first():
+            is_linked = True
+
+        c1, c2 = st.sidebar.columns([3, 1])
+        c1.text(f['name'])
+        if not is_linked:
+            if c2.button("Add", key=f['ticker']):
+                fetch_and_save_fund_profile(f['ticker'], f['cat'], st.session_state.user_id)
+                update_price_history(session.query(FundProfile).filter_by(ticker=f['ticker']).first().isin)
+                st.rerun()
         else:
-            col2.caption("✅")
-else:
-    with st.sidebar.form("import_form"):
-        new_ticker = st.text_input("Ticker Symbol")
-        new_cat = st.selectbox("Category", ["Global", "Nordic", "Tech", "Energy", "Custom"])
-        if st.form_submit_button("Fetch & Add"):
-            with st.spinner("Scraping..."):
-                isin, res = fetch_and_save_fund_profile(new_ticker, new_cat)
-                if isin:
-                    update_price_history(isin)
-                    st.success(f"Added: {res}")
+            c2.caption("✅")
 
-# TABS
-tab1, tab2 = st.tabs(["🚀 Allocation Strategy", "📊 Portfolio Dashboard"])
+    # MAIN TABS
+    tab1, tab2 = st.tabs(["🧠 AI Strategy Agent", "📊 Portfolio"])
 
-with tab1:
-    st.subheader("New Cash Allocation")
-    all_funds = session.query(FundProfile).all()
+    # --- TAB 1: AI AGENT (OPTIMIZED) ---
+    with tab1:
+        st.subheader("AI Portfolio Architect")
 
-    with st.expander("📂 Your Active Fund Universe", expanded=True):
-        if not all_funds:
-            st.warning("No funds found! Add via Sidebar.")
+        links = session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id).all()
+        my_funds = session.query(FundProfile).filter(FundProfile.isin.in_([l.isin for l in links])).all()
+
+        if not my_funds:
+            st.warning("Your universe is empty. Add funds from the sidebar first.")
         else:
-            u_cols = st.columns(3)
-            for i, f in enumerate(all_funds):
-                latest_p = get_latest_price(f.isin)
-                with u_cols[i % 3]:
-                    st.markdown(f"**{f.name}**")
-                    st.caption(f"Price: {latest_p:.2f}")
-
-    st.markdown("---")
-    mode = st.radio("Mode", ["Live", "Backtest"], horizontal=True)
-    amount = st.number_input("Amount to Invest (NOK)", step=5000.0)
-    sim_date = st.date_input("Date") if mode == "Backtest" else datetime.now()
-
-    if amount > 0:
-        global_f = next((f for f in all_funds if f.category == 'Global'), all_funds[0] if all_funds else None)
-        nordic_f = next((f for f in all_funds if f.category == 'Nordic'), None)
-        rec_map = {}
-        if global_f: rec_map[global_f.isin] = amount * 0.7
-        if nordic_f: rec_map[nordic_f.isin] = amount * 0.2
-        buffer = amount - sum(rec_map.values())
-        if buffer > 0: rec_map['BANK'] = buffer
-
-        st.info("💡 **AI Suggestion:** Customize below.")
-
-        # Initialize Form ID to handle reset
-        if 'form_id' not in st.session_state: st.session_state.form_id = 0
-
-        # FORM START
-        with st.form(key=f"alloc_form_{st.session_state.form_id}"):
-            allocs = {}
-            st.subheader("Customize Your Split")
-            c1, c2 = st.columns(2)
-            # Dynamic keys attached to form_id prevent sticky values
-            allocs['BANK'] = c1.number_input("Savings / Buffer", value=float(rec_map.get('BANK', 0.0)),
-                                             key=f"bank_{st.session_state.form_id}")
-            allocs['DEBT'] = c2.number_input("Debt Paydown (5.06%)", value=0.0, key=f"debt_{st.session_state.form_id}")
-
-            st.markdown("#### Market Funds")
-            cols = st.columns(2)
-            for i, fund in enumerate(all_funds):
-                default_val = float(rec_map.get(fund.isin, 0.0))
-                with cols[i % 2]:
-                    st.markdown(f"**{fund.name}**")
-                    allocs[fund.isin] = st.number_input(f"Invest in {fund.ticker}", value=default_val,
-                                                        key=f"inv_{fund.isin}_{st.session_state.form_id}")
+            with st.expander("📂 My Active Fund Universe"):
+                for f in my_funds: st.text(f"• {f.name} ({f.region})")
 
             st.markdown("---")
-            total = sum(allocs.values())
+            c_a, c_b = st.columns(2)
+            amount = c_a.number_input("Cash to Deploy (NOK)", step=5000.0)
+            risk = c_b.select_slider("Risk Profile", options=["Conservative", "Moderate", "Growth", "Aggressive"],
+                                     value="Growth")
 
-            if abs(total - amount) < 1.0:
-                st.success(f"Total: {total:,.0f} NOK matches.")
-                ready = True
-            else:
-                st.warning(f"Allocated: {total:,.0f} / {amount:,.0f} NOK")
-                ready = False
+            # --- SESSION STATE MANAGEMENT FOR AI ---
+            if 'agent_result' not in st.session_state: st.session_state.agent_result = None
+            if 'agent_amount' not in st.session_state: st.session_state.agent_amount = 0.0
 
-            # SUBMIT BUTTON (LOGIC IS STRICTLY INSIDE)
-            submitted = st.form_submit_button("Confirm Investment")
-            if submitted:
-                if ready:
-                    for k, v in allocs.items():
-                        if v > 0:
-                            n = "Savings" if k == 'BANK' else ("Debt" if k == 'DEBT' else "Fund")
-                            log_investment(v, k, n, 4, sim_date if mode == "Backtest" else None)
-                    st.success("Investment Logged!")
-                    st.session_state.form_id += 1  # Force clear form inputs
-                    st.rerun()
+            # RESET button logic: If amount changes significantly, clear old result?
+            # Ideally, user must click 'Generate' again.
 
-with tab2:
-    st.subheader(f"Portfolio ({curr_opt})")
-    df = get_portfolio_df()
+            if amount > 0:
+                # 1. GENERATE BUTTON (Trigger API call)
+                # Show button only if we don't have a result OR if user wants to regenerate
+                col_gen, col_reset = st.columns([1, 4])
 
-    if not df.empty:
-        df_d = df.copy()
-        for c in ['Invested', 'Current Value', 'Profit', 'Entry Price']:
-            df_d[c] = df_d[c] / rate
+                if st.session_state.agent_result is None:
+                    if col_gen.button("⚡ Generate AI Strategy", type="primary"):
+                        if not gemini_key:
+                            st.warning("⚠️ Please enter Gemini API Key in sidebar.")
+                        else:
+                            agent = StrategyAgent(api_key=gemini_key)
+                            user_prof = {'tax_residence': st.session_state.residences, 'risk': risk}
+                            with st.spinner("🤖 Consulting Gemini 2.5 Flash..."):
+                                rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount)
+                                st.session_state.agent_result = {'allocs': rec_map, 'reasoning': reasoning}
+                                st.session_state.agent_amount = amount  # Store amount used
+                                st.rerun()
 
-        df_grouped = df_d.groupby('Allocation', as_index=False).agg({
-            'Invested': 'sum', 'Current Value': 'sum', 'Profit': 'sum', 'ISIN': 'first'
-        })
-        df_grouped['Return (%)'] = ((df_grouped['Current Value'] - df_grouped['Invested']) / df_grouped[
-            'Invested']) * 100
+                # 2. DISPLAY RESULT (If exists)
+                if st.session_state.agent_result:
+                    res = st.session_state.agent_result
 
-        tot_inv = df_grouped['Invested'].sum()
-        tot_val = df_grouped['Current Value'].sum()
-        roi = ((tot_val - tot_inv) / tot_inv) * 100 if tot_inv else 0
+                    st.markdown("### 🤖 Agent Recommendation")
 
-        m1, m2 = st.columns(2)
-        m1.metric("Total Value", f"{sym} {tot_val:,.0f}")
-        m2.metric("Total ROI", f"{roi:.2f}%", delta=f"{tot_val - tot_inv:,.0f} {sym}")
+                    # Warnings if amount changed
+                    if amount != st.session_state.agent_amount:
+                        st.warning(
+                            f"⚠️ Strategy generated for {st.session_state.agent_amount:,.0f} NOK, but input is {amount:,.0f} NOK. Please Regenerate.")
 
-        fund_isins = [x for x in df['ISIN'].unique() if x not in ['BANK', 'DEBT']]
-        if fund_isins:
-            sel = st.selectbox("Select History", fund_isins,
-                               format_func=lambda x: session.query(FundProfile).filter_by(isin=x).first().name)
-            fig = plot_history(session, sel, sym, rate)
-            if fig: st.plotly_chart(fig, use_container_width=True)
+                    if "Error" in res['reasoning']:
+                        st.error(res['reasoning'])
+                    else:
+                        st.info(f"**Reasoning:** {res['reasoning']}")
 
-        st.markdown("#### Holdings Summary")
-        st.dataframe(df_grouped[['Allocation', 'Invested', 'Current Value', 'Profit', 'Return (%)']].style.format({
-            'Invested': f"{sym} {{:,.0f}}", 'Current Value': f"{sym} {{:,.0f}}",
-            'Profit': f"{sym} {{:,.0f}}", 'Return (%)': "{:+.2f}%"
-        }), use_container_width=True)
+                        # Regenerate Option
+                        if st.button("🔄 Regenerate Strategy"):
+                            st.session_state.agent_result = None
+                            st.rerun()
 
-        with st.expander("View Transaction Log"):
-            st.dataframe(df_d[['Date', 'Allocation', 'Invested', 'Entry Price']].style.format({
-                'Date': '{:%Y-%m-%d}', 'Invested': f"{sym} {{:,.0f}}", 'Entry Price': f"{sym} {{:,.2f}}"
-            }))
-    else:
-        st.info("No investments found.")
+                        # Execution Form
+                        with st.form("agent_exec"):
+                            final_allocs = {}
+                            cols = st.columns(2)
+                            rec_map = res['allocs']
+
+                            # Pre-fill form
+                            for i, (isin, val) in enumerate(rec_map.items()):
+                                fname = next((f.name for f in my_funds if f.isin == isin), isin)
+                                with cols[i % 2]:
+                                    # Scale value if amount changed (optional user convenience)
+                                    final_allocs[isin] = st.number_input(f"{fname}", value=float(val))
+
+                            rem = amount - sum(final_allocs.values())
+                            if rem > 0:
+                                st.caption(f"Remaining: {rem:,.0f} NOK")
+                                c1, c2 = st.columns(2)
+                                final_allocs['BANK'] = c1.number_input("Savings", value=rem)
+                                final_allocs['DEBT'] = c2.number_input("Debt Paydown", value=0.0)
+
+                            if st.form_submit_button("Execute Strategy"):
+                                for isin, amt in final_allocs.items():
+                                    if amt > 0:
+                                        n = "Savings" if isin == 'BANK' else ("Debt" if isin == 'DEBT' else "Fund")
+                                        log_investment(st.session_state.user_id, amt, isin, n, 4)
+                                st.success("Executed!")
+                                # Clear result after success so user can start fresh next time
+                                st.session_state.agent_result = None
+                                st.rerun()
+
+    # --- TAB 2: PORTFOLIO ---
+    with tab2:
+        rates = get_exchange_rates()
+        curr_opt = st.radio("Display Currency", ["NOK", "EUR", "USD"], horizontal=True)
+        if curr_opt == "NOK":
+            rate = 1.0; sym = "kr"
+        elif curr_opt == "EUR":
+            rate = rates['EUR']; sym = "€"
+        else:
+            rate = rates['USD']; sym = "$"
+
+        df = get_portfolio_df(st.session_state.user_id)
+        if not df.empty:
+            df_d = df.copy()
+            for c in ['Invested', 'Current Value', 'Profit', 'Entry Price']: df_d[c] = df_d[c] / rate
+
+            df_g = df_d.groupby('Allocation', as_index=False).agg({
+                'Invested': 'sum', 'Current Value': 'sum', 'Profit': 'sum', 'ISIN': 'first'
+            })
+            df_g['Return (%)'] = ((df_g['Current Value'] - df_g['Invested']) / df_g['Invested']) * 100
+
+            tot_val = df_g['Current Value'].sum()
+            roi = ((df_g['Current Value'].sum() - df_g['Invested'].sum()) / df_g['Invested'].sum()) * 100
+
+            m1, m2 = st.columns(2)
+            m1.metric("Total Value", f"{sym} {tot_val:,.0f}")
+            m2.metric("Total ROI", f"{roi:.2f}%")
+
+            fund_isins = [x for x in df['ISIN'].unique() if x not in ['BANK', 'DEBT']]
+            if fund_isins:
+                sel = st.selectbox("History", fund_isins,
+                                   format_func=lambda x: session.query(FundProfile).filter_by(isin=x).first().name)
+                fig = plot_history(session, st.session_state.user_id, sel, sym, rate)
+                if fig: st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(df_g[['Allocation', 'Invested', 'Current Value', 'Return (%)']].style.format({
+                'Invested': f"{sym} {{:,.0f}}", 'Current Value': f"{sym} {{:,.0f}}", 'Return (%)': "{:+.2f}%"
+            }), use_container_width=True)
+        else:
+            st.info("No investments found.")

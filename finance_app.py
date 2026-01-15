@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 import json
 import hashlib
-import google.generativeai as genai  # NEW LIBRARY
+import google.generativeai as genai
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, desc, Text, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 # 🧠 AI AGENT CONFIGURATION
 # ==========================================
 SYSTEM_PROMPT_TEMPLATE = """
-You are a CFA-certified Chief Investment Officer (CIO) specializing in global funds and de-resking strategies.
+You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-efficient portfolio construction for retail investors.
 
 **User Profile:**
 - **Tax Residence:** {tax_residence}
@@ -32,7 +32,12 @@ You are a CFA-certified Chief Investment Officer (CIO) specializing in global fu
 **Your Mission:**
 Allocate the cash into the "Available Funds" to create an optimal portfolio based on the tax rules and risk profile.
 - You must ONLY use the funds provided in the list.
-- If the universe is poor, suggest the best available option.
+- You can suggest allocations to "BANK" (savings) or "DEBT" (paydown) if it makes more economical sense.
+- If the universe is poor, suggest the best available option and you can also suggest adding better funds available in that tax jurisdiction.
+- Provide a diversified allocation that balances risk and tax efficiency.
+- Your reasoning should reflect tax optimization and risk management with a focus on the user's profile.
+- Consider the user as a newby investor with no prior holdings.
+- Screen the geopolitical risk of funds based on their region and adjust allocations accordingly.
 
 **Output Format:**
 Respond with a strict JSON object (no markdown):
@@ -46,7 +51,7 @@ Respond with a strict JSON object (no markdown):
 # 1. DATABASE SETUP
 # ==========================================
 Base = declarative_base()
-engine = create_engine('sqlite:///personal_finance_v9_agent.db', echo=False)
+engine = create_engine('sqlite:///personal_finance_v10_complete.db', echo=False)
 
 
 class User(Base):
@@ -104,16 +109,54 @@ Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 session = Session()
 
+# ==========================================
+# 2. RESTORED: EXPANDED FUND LIST
+# ==========================================
+SUGGESTED_FUNDS = [
+    # GLOBAL / US
+    {"ticker": "SPY", "cat": "Global", "name": "SPDR S&P 500 ETF (US)", "countries": ["USA", "Global"]},
+    {"ticker": "QQQ", "cat": "Tech", "name": "Invesco QQQ (Nasdaq-100)", "countries": ["USA", "Global"]},
+    {"ticker": "VT", "cat": "Global", "name": "Vanguard Total World Stock", "countries": ["USA", "Global"]},
+    # NORWAY
+    {"ticker": "DNB.OL", "cat": "Norwegian", "name": "DNB Bank ASA", "countries": ["Norway"]},
+    {"ticker": "EQNR.OL", "cat": "Energy", "name": "Equinor ASA", "countries": ["Norway"]},
+    {"ticker": "MOWI.OL", "cat": "Seafood", "name": "Mowi ASA", "countries": ["Norway"]},
+    {"ticker": "YAR.OL", "cat": "Materials", "name": "Yara International", "countries": ["Norway"]},
+    {"ticker": "KOG.OL", "cat": "Defense", "name": "Kongsberg Gruppen", "countries": ["Norway"]},
+    {"ticker": "ORK.OL", "cat": "Consumer", "name": "Orkla ASA", "countries": ["Norway"]},
+    # FRANCE
+    {"ticker": "CW8.PA", "cat": "Global", "name": "Amundi MSCI World (PEA)", "countries": ["France"]},
+    {"ticker": "ESE.PA", "cat": "Global", "name": "BNP Paribas S&P 500 (PEA)", "countries": ["France"]},
+    {"ticker": "TTE.PA", "cat": "Energy", "name": "TotalEnergies SE", "countries": ["France"]},
+    {"ticker": "MC.PA", "cat": "Luxury", "name": "LVMH Moët Hennessy", "countries": ["France"]},
+    {"ticker": "AI.PA", "cat": "Materials", "name": "Air Liquide", "countries": ["France"]},
+    {"ticker": "OR.PA", "cat": "Beauty", "name": "L'Oréal", "countries": ["France"]},
+    # GERMANY / EU
+    {"ticker": "EUNL.DE", "cat": "Global", "name": "iShares Core MSCI World (UCITS)",
+     "countries": ["Germany", "Norway", "Sweden", "Denmark"]},
+    {"ticker": "SAP.DE", "cat": "Tech", "name": "SAP SE", "countries": ["Germany"]},
+    {"ticker": "SIE.DE", "cat": "Industrial", "name": "Siemens AG", "countries": ["Germany"]},
+    # SWEDEN
+    {"ticker": "INVE-B.ST", "cat": "Finance", "name": "Investor AB", "countries": ["Sweden"]},
+    {"ticker": "VOLV-B.ST", "cat": "Industrial", "name": "Volvo AB", "countries": ["Sweden"]},
+    {"ticker": "ATCO-A.ST", "cat": "Industrial", "name": "Atlas Copco", "countries": ["Sweden"]},
+    # DENMARK
+    {"ticker": "NOVO-B.CO", "cat": "Health", "name": "Novo Nordisk", "countries": ["Denmark", "Global"]},
+    {"ticker": "DSV.CO", "cat": "Logistics", "name": "DSV A/S", "countries": ["Denmark"]},
+    # UK
+    {"ticker": "HSBA.L", "cat": "Finance", "name": "HSBC Holdings", "countries": ["UK"]},
+    {"ticker": "AZN.L", "cat": "Health", "name": "AstraZeneca", "countries": ["UK"]},
+]
+
 
 # ==========================================
-# 2. STRATEGY AGENT (UPDATED FOR GEMINI)
+# 3. STRATEGY AGENT (WITH FIX)
 # ==========================================
 class StrategyAgent:
     def __init__(self, api_key):
         self.api_key = api_key
 
     def get_allocation(self, user_profile, funds, amount):
-        # 1. Prepare Data Context
         funds_context = []
         for f in funds:
             funds_context.append({
@@ -121,7 +164,6 @@ class StrategyAgent:
                 "category": f.category
             })
 
-        # 2. Build Prompt
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
             amount=amount,
@@ -130,22 +172,16 @@ class StrategyAgent:
             fund_list_json=json.dumps(funds_context, indent=2)
         )
 
-        # 3. CALL GEMINI
         if not self.api_key:
             return {}, "⚠️ No API Key provided. Please enter your Google Gemini Key in the sidebar."
 
         try:
             genai.configure(api_key=self.api_key)
+            # FIX: Updated model name to gemini-1.5-flash
             model = genai.GenerativeModel('gemini-2.5-flash')
 
-            # Request response
             response = model.generate_content(prompt)
-
-            # Clean response (Gemini often wraps JSON in ```json blocks)
-            raw_text = response.text
-            clean_text = raw_text.replace("```json", "").replace("```", "").strip()
-
-            # Parse JSON
+            clean_text = response.text.replace("```json", "").replace("```", "").strip()
             result = json.loads(clean_text)
 
             return result.get('allocations', {}), result.get('reasoning', "AI provided no reasoning.")
@@ -155,18 +191,8 @@ class StrategyAgent:
 
 
 # ==========================================
-# 3. CORE LOGIC & HELPERS
+# 4. CORE LOGIC & HELPERS
 # ==========================================
-SUGGESTED_FUNDS = [
-    {"ticker": "SPY", "cat": "Global", "name": "SPDR S&P 500 (US)", "countries": ["USA", "Global"]},
-    {"ticker": "EQNR.OL", "cat": "Energy", "name": "Equinor ASA", "countries": ["Norway"]},
-    {"ticker": "DNB.OL", "cat": "Finance", "name": "DNB Bank", "countries": ["Norway"]},
-    {"ticker": "CW8.PA", "cat": "Global", "name": "Amundi MSCI World (PEA)", "countries": ["France"]},
-    {"ticker": "EUNL.DE", "cat": "Global", "name": "iShares Core MSCI World", "countries": ["Germany", "Norway"]},
-    {"ticker": "NOVO-B.CO", "cat": "Health", "name": "Novo Nordisk", "countries": ["Denmark", "Global"]},
-]
-
-
 def make_hash(p): return hashlib.sha256(str.encode(p)).hexdigest()
 
 
@@ -287,7 +313,7 @@ def plot_history(session, user_id, isin, currency_sym, rate):
 
 
 # ==========================================
-# 4. MAIN UI
+# 5. MAIN UI
 # ==========================================
 st.set_page_config(page_title="FinStrat AI", layout="wide")
 if 'user_id' not in st.session_state: st.session_state.user_id = None
@@ -329,10 +355,34 @@ else:
     # API KEY INPUT
     st.sidebar.markdown("---")
     gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password", help="Get key from aistudio.google.com")
-
+    st.sidebar.text("🔑Try copy this temp-key: AIzaSyCjW1wqq9tPrYGMn9ed9ZHWQ3p-mZQBS8g")
     if st.sidebar.button("Logout"): st.session_state.user_id = None; st.rerun()
 
-    # 1. ADD FUNDS
+    # RESTORED: PRICE UPDATES SECTION
+    st.sidebar.markdown("---")
+    st.sidebar.header("🔄 Price Updates")
+    user_links = session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id).all()
+    user_fund_isins = [l.isin for l in user_links]
+
+    if user_fund_isins:
+        fund_map = {f.isin: f.name for f in
+                    session.query(FundProfile).filter(FundProfile.isin.in_(user_fund_isins)).all()}
+        selected_update = st.sidebar.multiselect("Select Funds:", user_fund_isins,
+                                                 format_func=lambda x: fund_map.get(x, x), default=user_fund_isins)
+        if st.sidebar.button("Update Selected Prices"):
+            if not selected_update:
+                st.sidebar.error("None selected.")
+            else:
+                progress = st.sidebar.progress(0)
+                for i, isin_code in enumerate(selected_update):
+                    update_price_history(isin_code)
+                    progress.progress((i + 1) / len(selected_update))
+                st.sidebar.success("Prices Updated!")
+                st.rerun()
+    else:
+        st.sidebar.info("Add funds to enable updates.")
+
+    # 1. ADD FUNDS (SMART DISCOVERY)
     st.sidebar.markdown("---")
     st.sidebar.header("Universe Builder")
 
@@ -341,11 +391,22 @@ else:
                             "Global" in f['countries'] or any(c in user_res for c in f['countries'])]
 
     for f in filtered_suggestions:
+        # Check if linked
+        prof = session.query(FundProfile).filter_by(ticker=f['ticker']).first()
+        is_linked = False
+        if prof:
+            if session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id, isin=prof.isin).first():
+                is_linked = True
+
         c1, c2 = st.sidebar.columns([3, 1])
         c1.text(f['name'])
-        if c2.button("Add", key=f['ticker']):
-            fetch_and_save_fund_profile(f['ticker'], f['cat'], st.session_state.user_id)
-            update_price_history(session.query(FundProfile).filter_by(ticker=f['ticker']).first().isin)
+        if not is_linked:
+            if c2.button("Add", key=f['ticker']):
+                fetch_and_save_fund_profile(f['ticker'], f['cat'], st.session_state.user_id)
+                update_price_history(session.query(FundProfile).filter_by(ticker=f['ticker']).first().isin)
+                st.rerun()
+        else:
+            c2.caption("✅")
 
     # 2. MAIN TABS
     tab1, tab2 = st.tabs(["🧠 AI Strategy Agent", "📊 Portfolio"])
@@ -375,12 +436,10 @@ else:
                 agent = StrategyAgent(api_key=gemini_key)
                 user_prof = {'tax_residence': st.session_state.residences, 'risk': risk}
 
-                # If key is missing, warn but don't crash
                 if not gemini_key:
                     st.warning("⚠️ Enter Gemini API Key in sidebar to get AI recommendations.")
-
                 else:
-                    with st.spinner("🤖 Consulting Gemini Pro Strategy Agent..."):
+                    with st.spinner("🤖 Consulting Gemini 1.5 Flash..."):
                         rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount)
 
                     st.markdown("### 🤖 Agent Recommendation")
@@ -394,18 +453,17 @@ else:
                             cols = st.columns(2)
                             # Pre-fill form with AI suggestions
                             for i, (isin, val) in enumerate(rec_map.items()):
-                                # Match ISIN to Name
                                 fname = next((f.name for f in my_funds if f.isin == isin), isin)
                                 with cols[i % 2]:
                                     allocs[isin] = st.number_input(f"{fname}", value=float(val))
 
-                            # Handle funds AI didn't pick (set to 0)
+                            # Handle funds AI didn't pick
                             for f in my_funds:
                                 if f.isin not in allocs:
-                                    # Hidden logic to include them in the form just in case
+                                    # Hidden input or just not allocated
                                     pass
 
-                                    # Remaining for Buffer/Debt
+                                    # Remaining
                             rem = amount - sum(allocs.values())
                             if rem > 0:
                                 st.caption(f"Remaining: {rem:,.0f} NOK")

@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
 
 # ==========================================
-# 🧠 AI AGENT CONFIGURATION
+# 🧠 AI AGENT CONFIGURATION (THE BRAIN)
 # ==========================================
 SYSTEM_PROMPT_TEMPLATE = """
 You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-efficient portfolio construction for retail investors.
@@ -19,38 +19,73 @@ You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-effic
 **User Profile:**
 - **Tax Residence:** {tax_residence}
 - **Investment Amount:** {amount} {currency}
-- **Risk Profile:** {risk_profile}
+- **Risk Profile:** {risk_profile} (Aggressive, Growth, Moderate, or Conservative)
+- **Current Savings Buffer:** {current_savings} {currency} (Approximate)
+- **Mortgage/Debt Interest Rate:** {debt_rate}%
 
-**Tax Rules to Apply:**
-1. **Norway:** Prioritize 'Aksjesparekonto' (ASK) eligible funds (EEA/EU domiciled).
+**Tax Rules (Strict Compliance):**
+1. **Norway:** Prioritize 'Aksjesparekonto' (ASK) eligible funds (EEA/EU domiciled ISINs).
 2. **France:** Prioritize 'PEA' eligible funds (European equities).
-3. **USA:** Avoid PFIC (Foreign Mutual Funds), favor US-domiciled ETFs.
+3. **USA:** Avoid PFIC (Foreign Mutual Funds); favor US-domiciled ETFs.
 
 **Available Funds (User's Universe):**
 {fund_list_json}
 
-**Your Mission:**
-Allocate the cash into the "Available Funds" to create an optimal portfolio based on the tax rules and risk profile.
-- You must ONLY use the funds provided in the list.
-- You can suggest allocations to "BANK" (savings) or "DEBT" (paydown) if needed.
-- If the universe is poor, suggest the best available option and suggest adding better funds available in that tax jurisdiction.
-- Provide a diversified allocation that balances risk and tax efficiency.
-- Your reasoning should reflect tax optimization and risk management with a focus on the user's profile.
-- Consider the user as a newby investor with no prior holdings.
+**Investment Strategy (The "Hierarchy of Wealth"):**
+Allocate the capital following this strict priority order:
+
+1.  **The Fortress (Safety & Liquidity):**
+    - Check the `BANK` / Savings option.
+    - If `{current_savings}` is low (< 50,000), allocate heavily here first.
+    - If Risk Profile is "Conservative", prioritize `BANK` regardless of savings.
+
+2.  **Debt Arbitrage (Guaranteed Return):**
+    - Check the `DEBT` / Paydown option.
+    - If `{debt_rate}` is > 5.0%, this is a risk-free guaranteed return. Allocate significantly here (30-50%) unless the user is "Aggressive".
+    - If `{debt_rate}` is < 3.5%, ignore this (cheap leverage).
+
+3.  **The Growth Engine (The Core Portfolio):**
+    - Allocate the remainder to Market Funds based on `{risk_profile}`:
+        - **Aggressive/Growth:** 80% Core (Global/US Index) + 20% Satellites (Sector/Tech/Energy).
+        - **Moderate:** 60% Core + 40% Safer Assets (Bond funds or Dividends).
+        - **Conservative:** Focus on Capital Preservation.
+    - **Geographic Bias:** Adjust the "Core" to fit the User's Tax Residence (e.g., Use EU funds for France/Norway).
+
+**Constraint Checklist:**
+- You must **ONLY** use the funds provided in the "Available Funds" list.
+- If the universe is poor (e.g., only 1 fund), allocate 100% to the best option or `BANK`.
 
 **Output Format:**
 Respond with a strict JSON object (no markdown):
 {{
-  "allocations": {{ "ISIN_CODE_1": AMOUNT_NUMBER, "ISIN_CODE_2": AMOUNT_NUMBER }},
-  "reasoning": "One sentence explaining the tax/risk logic used."
+  "allocations": {{ "ISIN_OR_TICKER_1": AMOUNT_NUMBER, "ISIN_OR_TICKER_2": AMOUNT_NUMBER }},
+  "reasoning": "Concise explanation of the split, referencing tax efficiency and the debt/risk trade-off."
 }}
+"""
+
+ANALYSIS_PROMPT_TEMPLATE = """
+You are a Risk Manager reviewing a user's proposed trade.
+
+**User Context:**
+- **Profile:** {risk_profile}, Residence: {tax_residence}
+- **Proposed Trade:**
+{proposed_allocation_json}
+
+**Task:**
+Analyze this specific allocation.
+1. Does it align with their risk profile?
+2. Is it tax-efficient for {tax_residence}?
+3. Are they over-exposed to any single sector or fund?
+
+**Output:**
+Provide a short, 3-sentence critique. Start with "✅ Approved" or "⚠️ Caution".
 """
 
 # ==========================================
 # 1. DATABASE SETUP
 # ==========================================
 Base = declarative_base()
-engine = create_engine('sqlite:///personal_finance_v11_optimized.db', echo=False)
+engine = create_engine('sqlite:///personal_finance_v15_final.db', echo=False)
 
 
 class User(Base):
@@ -142,45 +177,68 @@ SUGGESTED_FUNDS = [
 
 
 # ==========================================
-# 3. STRATEGY AGENT
+# 3. STRATEGY AGENT (HANDLES MODEL NAME)
 # ==========================================
 class StrategyAgent:
-    def __init__(self, api_key):
+    def __init__(self, api_key, model_name="gemini-1.5-flash"):
         self.api_key = api_key
+        self.model_name = model_name
 
     def get_allocation(self, user_profile, funds, amount):
-        funds_context = []
-        for f in funds:
-            funds_context.append({
-                "isin": f.isin, "name": f.name, "region": f.region,
-                "category": f.category
-            })
+        funds_context = [{
+            "isin": f.isin, "name": f.name, "region": f.region, "category": f.category
+        } for f in funds]
 
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
             amount=amount,
             currency="NOK",
             risk_profile=user_profile.get('risk', 'Growth'),
+            current_savings=user_profile.get('savings', 0),
+            debt_rate=user_profile.get('debt_rate', 0.0),
             fund_list_json=json.dumps(funds_context, indent=2)
         )
+        return self._call_gemini_json(prompt)
 
-        if not self.api_key:
-            return {}, "⚠️ No API Key provided. Please enter your Google Gemini Key in the sidebar."
+    def analyze_user_edit(self, user_profile, proposed_allocations, funds):
+        readable_alloc = {}
+        for isin, amt in proposed_allocations.items():
+            if amt > 0:
+                fname = next((f.name for f in funds if f.isin == isin), isin)
+                readable_alloc[fname] = amt
 
+        prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+            risk_profile=user_profile.get('risk', 'Growth'),
+            tax_residence=user_profile['tax_residence'],
+            proposed_allocation_json=json.dumps(readable_alloc, indent=2)
+        )
+        return self._call_gemini_text(prompt)
+
+    def _call_gemini_json(self, prompt):
+        if not self.api_key: return {}, "⚠️ No API Key."
         try:
             genai.configure(api_key=self.api_key)
-            model = genai.GenerativeModel('gemini-2.5-flash')
+            model = genai.GenerativeModel(self.model_name)
             response = model.generate_content(prompt)
-            clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            result = json.loads(clean_text)
-            return result.get('allocations', {}), result.get('reasoning', "AI provided no reasoning.")
-
+            clean = response.text.replace("```json", "").replace("```", "").strip()
+            res = json.loads(clean)
+            return res.get('allocations', {}), res.get('reasoning', "")
         except Exception as e:
             return {}, f"AI Error: {str(e)}"
 
+    def _call_gemini_text(self, prompt):
+        if not self.api_key: return "⚠️ No API Key."
+        try:
+            genai.configure(api_key=self.api_key)
+            model = genai.GenerativeModel(self.model_name)
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            return f"AI Error: {str(e)}"
+
 
 # ==========================================
-# 4. CORE LOGIC & HELPERS
+# 4. HELPERS
 # ==========================================
 def make_hash(p): return hashlib.sha256(str.encode(p)).hexdigest()
 
@@ -199,15 +257,16 @@ def register_user(u, p, c):
     return True, "Created."
 
 
-def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None):
+def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None, manual_isin=None):
     try:
         t = yf.Ticker(ticker)
         i = t.info
-        isin = i.get('isin', ticker)
-        name = i.get('longName', ticker)
+        isin = manual_isin if manual_isin else i.get('isin', ticker)
+        name = i.get('longName', i.get('shortName', ticker))
         reg = "Global"
-        if any(x in ticker for x in [".OL", ".PA", ".DE", ".CO"]): reg = "EEA"
+        if any(x in ticker for x in [".OL", ".PA", ".DE", ".CO", ".ST"]): reg = "EEA"
         if "US" in isin: reg = "US"
+
         prof = FundProfile(isin=isin, ticker=ticker, name=name, category=cat, region=reg)
         session.merge(prof)
         session.commit()
@@ -216,15 +275,15 @@ def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None):
                 session.add(UserFundSelection(user_id=user_id, isin=isin))
                 session.commit()
         return isin, name
-    except:
-        return None, "Error"
+    except Exception as e:
+        return None, str(e)
 
 
 def update_price_history(isin):
     p = session.query(FundProfile).filter_by(isin=isin).first()
     if not p: return
     try:
-        hist = yf.Ticker(p.ticker).history(period="1mo")
+        hist = yf.Ticker(p.ticker).history(period="5y")
         if not hist.empty:
             for date, row in hist.iterrows():
                 if not session.query(FundPriceHistory).filter_by(isin=isin, date=date).first():
@@ -243,8 +302,14 @@ def log_investment(user_id, amount, isin, alloc_type, risk, date_override=None):
     d = datetime.combine(date_override, datetime.min.time()) if date_override else datetime.now()
     p = 1.0
     if isin not in ['BANK', 'DEBT']:
-        if not date_override: update_price_history(isin)
-        p = get_latest_price(isin)
+        if date_override:
+            hist = session.query(FundPriceHistory).filter(FundPriceHistory.isin == isin,
+                                                          FundPriceHistory.date <= d).order_by(
+                desc(FundPriceHistory.date)).first()
+            p = hist.close_price if hist else get_latest_price(isin)
+        else:
+            update_price_history(isin)
+            p = get_latest_price(isin)
 
     session.add(
         FinancialRecord(user_id=user_id, date=d, year=d.year, amount=amount, allocation_type=alloc_type, isin=isin,
@@ -292,10 +357,9 @@ def plot_history(session, user_id, isin, currency_sym, rate):
     fig = px.line(df_h, x="Date", y="Price", title=f"{name} ({currency_sym})")
     if not df_inv.empty:
         fig.add_trace(go.Scatter(
-            x=df_inv["Date"], y=df_inv["Price"], mode='markers+text', name='My Investments',
-            marker=dict(size=14, color='Gold', symbol='star', line=dict(width=2, color='DarkSlateGrey')),
+            x=df_inv["Date"], y=df_inv["Price"], mode='markers+text', marker=dict(size=14, color='Gold', symbol='star'),
             text=[f"{a:,.0f}{currency_sym}" for a in df_inv["Amt"]], textposition="top center",
-            textfont=dict(color='white')
+            textfont=dict(color='black')
         ))
     fig.update_layout(template="plotly_white")
     return fig
@@ -304,14 +368,11 @@ def plot_history(session, user_id, isin, currency_sym, rate):
 # ==========================================
 # 5. MAIN UI
 # ==========================================
-st.set_page_config(page_title="FinStrat AI", layout="wide")
+st.set_page_config(page_title="FinStrat AI Pro", layout="wide")
 
-# --- AUTO-LOGIN LOGIC (PERSISTENCE) ---
+# --- LOGIN PERSISTENCE ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
-
-# Check for query param if session is empty
 if st.session_state.user_id is None:
-    # Use st.query_params (standard in newer Streamlit)
     params = st.query_params
     if "uid" in params:
         try:
@@ -337,91 +398,83 @@ if not st.session_state.user_id:
                     st.session_state.user_id = user.id
                     st.session_state.residences = user.tax_residences
                     st.session_state.username = user.username
-                    # SET QUERY PARAM FOR PERSISTENCE
                     st.query_params["uid"] = str(user.id)
                     st.rerun()
-    # with t2:
-    #     with st.form("r"):
-    #         nu, np = st.text_input("User"), st.text_input("Pass", type="password")
-    #         ct = st.multiselect("Tax", ["Norway", "France", "USA", "Germany", "Sweden"])
-    #         if st.form_submit_button("Create"):
-    #             register_user(nu, np, ct)
-    #             st.success("Done")
-
+    with t2:
+        with st.form("r"):
+            nu, np = st.text_input("User"), st.text_input("Pass", type="password")
+            ct = st.multiselect("Tax", ["Norway", "France", "USA", "Germany", "Sweden"])
+            if st.form_submit_button("Create"):
+                register_user(nu, np, ct)
+                st.success("Done")
     st.divider()
-    # if st.button("RESET DATABASE"):
-    #     Base.metadata.drop_all(engine);
-    #     Base.metadata.create_all(engine);
-    #     st.success("Reset!");
-    #     st.rerun()
+    if st.button("RESET DATABASE"):
+        Base.metadata.drop_all(engine);
+        Base.metadata.create_all(engine);
+        st.success("Reset!");
+        st.rerun()
 
 else:
     # --- DASHBOARD ---
     st.sidebar.title(f"👤 {st.session_state.username}")
     st.sidebar.info(f"Tax: {st.session_state.residences}")
+    st.sidebar.markdown("---")
+
+    # 🔑 KEY & MODEL
+    gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password")
+    ai_model = st.sidebar.text_input("🤖 AI Model Name", value="gemini-1.5-flash",
+                                     help="Enter 'gemini-2.0-flash-exp' or 'gemini-2.5' if available.")
 
     if st.sidebar.button("Logout"):
         st.session_state.user_id = None
-        st.query_params.clear()  # Clear persistence
+        st.query_params.clear()
         st.rerun()
 
-    # API KEY
-    st.sidebar.markdown("---")
-    gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password", help="Get key from aistudio.google.com")
-
-
-    # PRICE UPDATES
-    st.sidebar.markdown("---")
-    st.sidebar.header("🔄 Price Updates")
-    user_links = session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id).all()
-    user_fund_isins = [l.isin for l in user_links]
-
-    if user_fund_isins:
-        fund_map = {f.isin: f.name for f in
-                    session.query(FundProfile).filter(FundProfile.isin.in_(user_fund_isins)).all()}
-        selected_update = st.sidebar.multiselect("Select Funds:", user_fund_isins,
-                                                 format_func=lambda x: fund_map.get(x, x), default=user_fund_isins)
-        if st.sidebar.button("Update Selected Prices"):
-            if not selected_update:
-                st.sidebar.error("None selected.")
-            else:
-                progress = st.sidebar.progress(0)
-                for i, isin_code in enumerate(selected_update):
-                    update_price_history(isin_code)
-                    progress.progress((i + 1) / len(selected_update))
-                st.sidebar.success("Prices Updated!")
-                st.rerun()
-    else:
-        st.sidebar.info("Add funds to enable updates.")
-
-    # ADD FUNDS
+    # --- UNIVERSE BUILDER ---
     st.sidebar.markdown("---")
     st.sidebar.header("Universe Builder")
-    user_res = st.session_state.residences
-    filtered_suggestions = [f for f in SUGGESTED_FUNDS if
-                            "Global" in f['countries'] or any(c in user_res for c in f['countries'])]
+    sb_tab1, sb_tab2 = st.sidebar.tabs(["Recommended", "Manual ISIN"])
 
-    for f in filtered_suggestions:
-        prof = session.query(FundProfile).filter_by(ticker=f['ticker']).first()
-        is_linked = False
-        if prof and session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id,
-                                                               isin=prof.isin).first():
-            is_linked = True
+    with sb_tab1:
+        user_res = st.session_state.residences
+        filtered_suggestions = [f for f in SUGGESTED_FUNDS if
+                                "Global" in f['countries'] or any(c in user_res for c in f['countries'])]
+        for f in filtered_suggestions:
+            prof = session.query(FundProfile).filter_by(ticker=f['ticker']).first()
+            is_linked = False
+            if prof and session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id,
+                                                                   isin=prof.isin).first():
+                is_linked = True
+            c1, c2 = st.sidebar.columns([3, 1])
+            c1.text(f['name'])
+            if not is_linked:
+                if c2.button("Add", key=f['ticker']):
+                    fetch_and_save_fund_profile(f['ticker'], f['cat'], st.session_state.user_id)
+                    update_price_history(session.query(FundProfile).filter_by(ticker=f['ticker']).first().isin)
+                    st.rerun()
+            else:
+                c2.caption("✅")
 
-        c1, c2 = st.sidebar.columns([3, 1])
-        c1.text(f['name'])
-        if not is_linked:
-            if c2.button("Add", key=f['ticker']):
-                fetch_and_save_fund_profile(f['ticker'], f['cat'], st.session_state.user_id)
-                update_price_history(session.query(FundProfile).filter_by(ticker=f['ticker']).first().isin)
-                st.rerun()
-        else:
-            c2.caption("✅")
+    with sb_tab2:
+        with st.sidebar.form("manual_add"):
+            st.caption("Add by Ticker & ISIN.")
+            m_tick = st.text_input("Yahoo Ticker (e.g. EQNR.OL)")
+            m_isin = st.text_input("ISIN Code (e.g. NO0010096985)")
+            m_cat = st.selectbox("Category", ["Global", "Nordic", "Tech", "Energy"])
+            if st.form_submit_button("Add Fund"):
+                if m_tick and m_isin:
+                    res_isin, res_name = fetch_and_save_fund_profile(m_tick, m_cat, st.session_state.user_id,
+                                                                     manual_isin=m_isin)
+                    if res_isin:
+                        update_price_history(res_isin)
+                        st.success(f"Added {res_name}")
+                        st.rerun()
+                else:
+                    st.error("Both required.")
 
-    # MAIN TABS
+    # --- MAIN TABS ---
     tab1, tab2 = st.tabs(["🧠 AI Strategy Agent", "📊 Portfolio"])
 
-    # --- TAB 1: AI AGENT (OPTIMIZED) ---
     with tab1:
         st.subheader("AI Portfolio Architect")
 
@@ -432,91 +485,118 @@ else:
             st.warning("Your universe is empty. Add funds from the sidebar first.")
         else:
             with st.expander("📂 My Active Fund Universe"):
-                for f in my_funds: st.text(f"• {f.name} ({f.region})")
+                for f in my_funds: st.text(f"• {f.name} (ISIN: {f.isin})")
 
             st.markdown("---")
+            mode = st.radio("Mode", ["Live (Today)", "Backtest (Historical)"], horizontal=True)
+
             c_a, c_b = st.columns(2)
             amount = c_a.number_input("Cash to Deploy (NOK)", step=5000.0)
             risk = c_b.select_slider("Risk Profile", options=["Conservative", "Moderate", "Growth", "Aggressive"],
                                      value="Growth")
 
-            # --- SESSION STATE MANAGEMENT FOR AI ---
-            if 'agent_result' not in st.session_state: st.session_state.agent_result = None
-            if 'agent_amount' not in st.session_state: st.session_state.agent_amount = 0.0
+            with st.expander("💼 Financial Context (Required for AI)", expanded=True):
+                c1, c2 = st.columns(2)
+                current_savings = c1.number_input("Savings (Approx)", value=50000.0)
+                debt_rate = c2.number_input("Mortgage Rate (%)", value=5.5)
 
-            # RESET button logic: If amount changes significantly, clear old result?
-            # Ideally, user must click 'Generate' again.
+            sim_date = None
+            if mode == "Backtest (Historical)":
+                sim_date = st.date_input("Date", value=datetime.now() - timedelta(days=365))
+
+            # --- SESSION STATE ---
+            if 'agent_result' not in st.session_state: st.session_state.agent_result = None
+            if 'agent_analysis' not in st.session_state: st.session_state.agent_analysis = None
 
             if amount > 0:
-                # 1. GENERATE BUTTON (Trigger API call)
-                # Show button only if we don't have a result OR if user wants to regenerate
-                col_gen, col_reset = st.columns([1, 4])
-
+                # 1. GENERATE
                 if st.session_state.agent_result is None:
-                    if col_gen.button("⚡ Generate AI Strategy", type="primary"):
+                    if st.button("⚡ Generate AI Strategy", type="primary"):
                         if not gemini_key:
-                            st.warning("⚠️ Please enter Gemini API Key in sidebar.")
+                            st.warning("⚠️ Enter API Key.")
                         else:
-                            agent = StrategyAgent(api_key=gemini_key)
-                            user_prof = {'tax_residence': st.session_state.residences, 'risk': risk}
-                            with st.spinner("🤖 Consulting Gemini 2.5 Flash..."):
+                            agent = StrategyAgent(gemini_key, ai_model)
+                            user_prof = {'tax_residence': st.session_state.residences, 'risk': risk,
+                                         'savings': current_savings, 'debt_rate': debt_rate}
+                            with st.spinner(f"Consulting {ai_model}..."):
                                 rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount)
                                 st.session_state.agent_result = {'allocs': rec_map, 'reasoning': reasoning}
-                                st.session_state.agent_amount = amount  # Store amount used
                                 st.rerun()
 
-                # 2. DISPLAY RESULT (If exists)
+                # 2. DISPLAY & EDIT
                 if st.session_state.agent_result:
                     res = st.session_state.agent_result
+                    st.info(f"**AI Strategy:** {res['reasoning']}")
 
-                    st.markdown("### 🤖 Agent Recommendation")
+                    if st.button("🔄 Reset Strategy"):
+                        st.session_state.agent_result = None
+                        st.session_state.agent_analysis = None
+                        st.rerun()
 
-                    # Warnings if amount changed
-                    if amount != st.session_state.agent_amount:
-                        st.warning(
-                            f"⚠️ Strategy generated for {st.session_state.agent_amount:,.0f} NOK, but input is {amount:,.0f} NOK. Please Regenerate.")
+                    st.markdown("#### 🛠 Customize & Execute")
+                    with st.form("agent_exec"):
+                        final_allocs = {}
 
-                    if "Error" in res['reasoning']:
-                        st.error(res['reasoning'])
-                    else:
-                        st.info(f"**Reasoning:** {res['reasoning']}")
+                        # AI SUGGESTIONS
+                        st.markdown("**AI Suggestions**")
+                        cols = st.columns(2)
+                        rec_map = res['allocs']
+                        for i, (isin, val) in enumerate(rec_map.items()):
+                            fname = next((f.name for f in my_funds if f.isin == isin), isin)
+                            with cols[i % 2]:
+                                final_allocs[isin] = st.number_input(f"{fname}", value=float(val), key=f"alloc_{isin}")
 
-                        # Regenerate Option
-                        if st.button("🔄 Regenerate Strategy"):
-                            st.session_state.agent_result = None
-                            st.rerun()
+                        # MANUAL ADD FUNDS
+                        st.markdown("**Add Other Funds**")
+                        existing_isins = list(rec_map.keys())
+                        avail_other = [f for f in my_funds if f.isin not in existing_isins]
 
-                        # Execution Form
-                        with st.form("agent_exec"):
-                            final_allocs = {}
-                            cols = st.columns(2)
-                            rec_map = res['allocs']
+                        if avail_other:
+                            added_funds = st.multiselect("Select funds to add:",
+                                                         options=[f.isin for f in avail_other],
+                                                         format_func=lambda x: next(
+                                                             (f.name for f in avail_other if f.isin == x), x))
 
-                            # Pre-fill form
-                            for i, (isin, val) in enumerate(rec_map.items()):
-                                fname = next((f.name for f in my_funds if f.isin == isin), isin)
-                                with cols[i % 2]:
-                                    # Scale value if amount changed (optional user convenience)
-                                    final_allocs[isin] = st.number_input(f"{fname}", value=float(val))
+                            for added_isin in added_funds:
+                                fname = next((f.name for f in avail_other if f.isin == added_isin), added_isin)
+                                final_allocs[added_isin] = st.number_input(f"{fname} (Manual Add)", value=0.0,
+                                                                           key=f"manual_{added_isin}")
 
-                            rem = amount - sum(final_allocs.values())
-                            if rem > 0:
-                                st.caption(f"Remaining: {rem:,.0f} NOK")
-                                c1, c2 = st.columns(2)
-                                final_allocs['BANK'] = c1.number_input("Savings", value=rem)
-                                final_allocs['DEBT'] = c2.number_input("Debt Paydown", value=0.0)
+                        # BUFFER
+                        rem = amount - sum(final_allocs.values())
+                        if rem != 0: st.caption(f"Remaining / Overallocated: {rem:,.0f} NOK")
+                        c1, c2 = st.columns(2)
+                        final_allocs['BANK'] = c1.number_input("Savings", value=max(0.0, rem))
+                        final_allocs['DEBT'] = c2.number_input("Debt Paydown", value=0.0)
 
-                            if st.form_submit_button("Execute Strategy"):
-                                for isin, amt in final_allocs.items():
-                                    if amt > 0:
-                                        n = "Savings" if isin == 'BANK' else ("Debt" if isin == 'DEBT' else "Fund")
-                                        log_investment(st.session_state.user_id, amt, isin, n, 4)
-                                st.success("Executed!")
-                                # Clear result after success so user can start fresh next time
-                                st.session_state.agent_result = None
+                        # ACTIONS
+                        c_sub1, c_sub2 = st.columns(2)
+                        analyze_clk = c_sub1.form_submit_button("🔎 Analyze My Changes")
+                        exec_clk = c_sub2.form_submit_button("✅ Execute Investment")
+
+                        if analyze_clk:
+                            agent = StrategyAgent(gemini_key, ai_model)
+                            user_prof = {'tax_residence': st.session_state.residences, 'risk': risk}
+                            with st.spinner("Analyzing custom allocation..."):
+                                analysis = agent.analyze_user_edit(user_prof, final_allocs, my_funds)
+                                st.session_state.agent_analysis = analysis
                                 st.rerun()
 
-    # --- TAB 2: PORTFOLIO ---
+                        if exec_clk:
+                            for isin, amt in final_allocs.items():
+                                if amt > 0:
+                                    n = "Savings" if isin == 'BANK' else ("Debt" if isin == 'DEBT' else "Fund")
+                                    log_investment(st.session_state.user_id, amt, isin, n, 4, date_override=sim_date)
+                            st.success("Executed!")
+                            st.session_state.agent_result = None
+                            st.session_state.agent_analysis = None
+                            st.rerun()
+
+                    # SHOW ANALYSIS
+                    if st.session_state.agent_analysis:
+                        st.markdown("### 🤖 Strategy Critique")
+                        st.warning(st.session_state.agent_analysis)
+
     with tab2:
         rates = get_exchange_rates()
         curr_opt = st.radio("Display Currency", ["NOK", "EUR", "USD"], horizontal=True)

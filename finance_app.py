@@ -11,10 +11,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
 
 # ==========================================
-# 🧠 AI AGENT CONFIGURATION (THE BRAIN)
+# 🧠 AI AGENT CONFIGURATION
 # ==========================================
 SYSTEM_PROMPT_TEMPLATE = """
-You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-efficient portfolio construction for retail investors.
+You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-efficient portfolio construction.
 
 **User Profile:**
 - **Tax Residence:** {tax_residence}
@@ -30,6 +30,9 @@ You are a CFA-certified Chief Investment Officer (CIO) specializing in tax-effic
 
 **Available Funds (User's Universe):**
 {fund_list_json}
+
+**Current Portfolio Holdings (Existing Exposure):**
+{portfolio_json}
 
 **Investment Strategy (The "Hierarchy of Wealth"):**
 Allocate the capital following this strict priority order:
@@ -68,14 +71,17 @@ You are a Risk Manager reviewing a user's proposed trade.
 
 **User Context:**
 - **Profile:** {risk_profile}, Residence: {tax_residence}
-- **Proposed Trade:**
+- **Proposed Final Trade:**
 {proposed_allocation_json}
+
+**Current Portfolio Context:**
+{portfolio_json}
 
 **Task:**
 Analyze this specific allocation.
 1. Does it align with their risk profile?
 2. Is it tax-efficient for {tax_residence}?
-3. Are they over-exposed to any single sector or fund?
+3. Does it fix or worsen any portfolio concentration issues?
 
 **Output:**
 Provide a short, 3-sentence critique. Start with "✅ Approved" or "⚠️ Caution".
@@ -85,7 +91,7 @@ Provide a short, 3-sentence critique. Start with "✅ Approved" or "⚠️ Cauti
 # 1. DATABASE SETUP
 # ==========================================
 Base = declarative_base()
-engine = create_engine('sqlite:///personal_finance_v15_final.db', echo=False)
+engine = create_engine('sqlite:///personal_finance_v18_final.db', echo=False)
 
 
 class User(Base):
@@ -177,17 +183,19 @@ SUGGESTED_FUNDS = [
 
 
 # ==========================================
-# 3. STRATEGY AGENT (HANDLES MODEL NAME)
+# 3. STRATEGY AGENT
 # ==========================================
 class StrategyAgent:
     def __init__(self, api_key, model_name="gemini-1.5-flash"):
         self.api_key = api_key
         self.model_name = model_name
 
-    def get_allocation(self, user_profile, funds, amount):
+    def get_allocation(self, user_profile, funds, amount, current_portfolio):
         funds_context = [{
             "isin": f.isin, "name": f.name, "region": f.region, "category": f.category
         } for f in funds]
+
+        portfolio_context = json.dumps(current_portfolio, indent=2) if current_portfolio else "Empty Portfolio."
 
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
@@ -196,21 +204,25 @@ class StrategyAgent:
             risk_profile=user_profile.get('risk', 'Growth'),
             current_savings=user_profile.get('savings', 0),
             debt_rate=user_profile.get('debt_rate', 0.0),
-            fund_list_json=json.dumps(funds_context, indent=2)
+            fund_list_json=json.dumps(funds_context, indent=2),
+            portfolio_json=portfolio_context
         )
         return self._call_gemini_json(prompt)
 
-    def analyze_user_edit(self, user_profile, proposed_allocations, funds):
+    def analyze_user_edit(self, user_profile, proposed_allocations, funds, current_portfolio):
         readable_alloc = {}
         for isin, amt in proposed_allocations.items():
             if amt > 0:
                 fname = next((f.name for f in funds if f.isin == isin), isin)
                 readable_alloc[fname] = amt
 
+        portfolio_context = json.dumps(current_portfolio, indent=2) if current_portfolio else "Empty Portfolio."
+
         prompt = ANALYSIS_PROMPT_TEMPLATE.format(
             risk_profile=user_profile.get('risk', 'Growth'),
             tax_residence=user_profile['tax_residence'],
-            proposed_allocation_json=json.dumps(readable_alloc, indent=2)
+            proposed_allocation_json=json.dumps(readable_alloc, indent=2),
+            portfolio_json=portfolio_context
         )
         return self._call_gemini_text(prompt)
 
@@ -266,7 +278,6 @@ def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None, manual_isin=
         reg = "Global"
         if any(x in ticker for x in [".OL", ".PA", ".DE", ".CO", ".ST"]): reg = "EEA"
         if "US" in isin: reg = "US"
-
         prof = FundProfile(isin=isin, ticker=ticker, name=name, category=cat, region=reg)
         session.merge(prof)
         session.commit()
@@ -335,6 +346,35 @@ def get_portfolio_df(user_id):
     return pd.DataFrame(data)
 
 
+def get_portfolio_context(user_id):
+    df = get_portfolio_df(user_id)
+    if df.empty: return []
+    summary = df.groupby('Allocation', as_index=False).agg({
+        'Current Value': 'sum',
+        'ISIN': 'first'
+    })
+    context = []
+    for _, row in summary.iterrows():
+        isin = row['ISIN']
+        category = "Unknown"
+        region = "Global"
+        if isin in ['BANK', 'DEBT']:
+            category = "Cash/Debt"
+            region = "Local"
+        else:
+            prof = session.query(FundProfile).filter_by(isin=isin).first()
+            if prof:
+                category = prof.category
+                region = prof.region
+        context.append({
+            "name": row['Allocation'],
+            "current_value_nok": round(row['Current Value'], 0),
+            "category": category,
+            "region": region
+        })
+    return context
+
+
 def get_exchange_rates():
     try:
         t = yf.Tickers('EURNOK=X USDNOK=X')
@@ -370,7 +410,6 @@ def plot_history(session, user_id, isin, currency_sym, rate):
 # ==========================================
 st.set_page_config(page_title="FinStrat AI Pro", layout="wide")
 
-# --- LOGIN PERSISTENCE ---
 if 'user_id' not in st.session_state: st.session_state.user_id = None
 if st.session_state.user_id is None:
     params = st.query_params
@@ -385,7 +424,6 @@ if st.session_state.user_id is None:
         except:
             pass
 
-# --- AUTH SCREEN ---
 if not st.session_state.user_id:
     st.title("🤖 FinStrat AI: Agent Login")
     t1, t2 = st.tabs(["Login", "Register"])
@@ -415,25 +453,23 @@ if not st.session_state.user_id:
         st.rerun()
 
 else:
-    # --- DASHBOARD ---
+    # DASHBOARD
     st.sidebar.title(f"👤 {st.session_state.username}")
     st.sidebar.info(f"Tax: {st.session_state.residences}")
     st.sidebar.markdown("---")
 
-    # 🔑 KEY & MODEL
     gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password")
-    ai_model = st.sidebar.text_input("🤖 AI Model Name", value="gemini-1.5-flash",
-                                     help="Enter 'gemini-2.0-flash-exp' or 'gemini-2.5' if available.")
+    ai_model = st.sidebar.text_input("🤖 AI Model", value="gemini-1.5-flash")
 
     if st.sidebar.button("Logout"):
         st.session_state.user_id = None
         st.query_params.clear()
         st.rerun()
 
-    # --- UNIVERSE BUILDER ---
+    # UNIVERSE BUILDER
     st.sidebar.markdown("---")
     st.sidebar.header("Universe Builder")
-    sb_tab1, sb_tab2 = st.sidebar.tabs(["Recommended", "Manual ISIN"])
+    sb_tab1, sb_tab2 = st.sidebar.tabs(["Recommendations", "Manual ISIN"])
 
     with sb_tab1:
         user_res = st.session_state.residences
@@ -454,12 +490,10 @@ else:
                     st.rerun()
             else:
                 c2.caption("✅")
-
     with sb_tab2:
         with st.sidebar.form("manual_add"):
-            st.caption("Add by Ticker & ISIN.")
-            m_tick = st.text_input("Yahoo Ticker (e.g. EQNR.OL)")
-            m_isin = st.text_input("ISIN Code (e.g. NO0010096985)")
+            m_tick = st.text_input("Yahoo Ticker")
+            m_isin = st.text_input("ISIN Code")
             m_cat = st.selectbox("Category", ["Global", "Nordic", "Tech", "Energy"])
             if st.form_submit_button("Add Fund"):
                 if m_tick and m_isin:
@@ -469,10 +503,8 @@ else:
                         update_price_history(res_isin)
                         st.success(f"Added {res_name}")
                         st.rerun()
-                else:
-                    st.error("Both required.")
 
-    # --- MAIN TABS ---
+    # TABS
     tab1, tab2 = st.tabs(["🧠 AI Strategy Agent", "📊 Portfolio"])
 
     with tab1:
@@ -482,20 +514,19 @@ else:
         my_funds = session.query(FundProfile).filter(FundProfile.isin.in_([l.isin for l in links])).all()
 
         if not my_funds:
-            st.warning("Your universe is empty. Add funds from the sidebar first.")
+            st.warning("Your universe is empty. Add funds from the sidebar.")
         else:
             with st.expander("📂 My Active Fund Universe"):
                 for f in my_funds: st.text(f"• {f.name} (ISIN: {f.isin})")
 
             st.markdown("---")
             mode = st.radio("Mode", ["Live (Today)", "Backtest (Historical)"], horizontal=True)
-
             c_a, c_b = st.columns(2)
             amount = c_a.number_input("Cash to Deploy (NOK)", step=5000.0)
             risk = c_b.select_slider("Risk Profile", options=["Conservative", "Moderate", "Growth", "Aggressive"],
                                      value="Growth")
 
-            with st.expander("💼 Financial Context (Required for AI)", expanded=True):
+            with st.expander("💼 Financial Context", expanded=True):
                 c1, c2 = st.columns(2)
                 current_savings = c1.number_input("Savings (Approx)", value=50000.0)
                 debt_rate = c2.number_input("Mortgage Rate (%)", value=5.5)
@@ -504,12 +535,11 @@ else:
             if mode == "Backtest (Historical)":
                 sim_date = st.date_input("Date", value=datetime.now() - timedelta(days=365))
 
-            # --- SESSION STATE ---
             if 'agent_result' not in st.session_state: st.session_state.agent_result = None
             if 'agent_analysis' not in st.session_state: st.session_state.agent_analysis = None
+            if 'selected_extras' not in st.session_state: st.session_state.selected_extras = []
 
             if amount > 0:
-                # 1. GENERATE
                 if st.session_state.agent_result is None:
                     if st.button("⚡ Generate AI Strategy", type="primary"):
                         if not gemini_key:
@@ -518,12 +548,12 @@ else:
                             agent = StrategyAgent(gemini_key, ai_model)
                             user_prof = {'tax_residence': st.session_state.residences, 'risk': risk,
                                          'savings': current_savings, 'debt_rate': debt_rate}
+                            curr_port = get_portfolio_context(st.session_state.user_id)
                             with st.spinner(f"Consulting {ai_model}..."):
-                                rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount)
+                                rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount, curr_port)
                                 st.session_state.agent_result = {'allocs': rec_map, 'reasoning': reasoning}
                                 st.rerun()
 
-                # 2. DISPLAY & EDIT
                 if st.session_state.agent_result:
                     res = st.session_state.agent_result
                     st.info(f"**AI Strategy:** {res['reasoning']}")
@@ -531,54 +561,60 @@ else:
                     if st.button("🔄 Reset Strategy"):
                         st.session_state.agent_result = None
                         st.session_state.agent_analysis = None
+                        st.session_state.selected_extras = []
                         st.rerun()
 
                     st.markdown("#### 🛠 Customize & Execute")
+
+                    # 1. SELECT EXTRA FUNDS (OUTSIDE FORM to trigger re-run)
+                    rec_map = res['allocs']
+                    existing_isins = list(rec_map.keys())
+                    avail_other = [f for f in my_funds if f.isin not in existing_isins]
+
+                    if avail_other:
+                        st.caption("Select other funds from your universe to allocate cash to:")
+                        st.session_state.selected_extras = st.multiselect(
+                            "Add Funds:",
+                            options=[f.isin for f in avail_other],
+                            format_func=lambda x: next((f.name for f in avail_other if f.isin == x), x),
+                            default=st.session_state.selected_extras
+                        )
+
+                    # 2. EXECUTION FORM
                     with st.form("agent_exec"):
                         final_allocs = {}
 
-                        # AI SUGGESTIONS
-                        st.markdown("**AI Suggestions**")
-                        cols = st.columns(2)
-                        rec_map = res['allocs']
-                        for i, (isin, val) in enumerate(rec_map.items()):
+                        st.markdown("**Allocation Split**")
+                        # AI Funds
+                        for isin, val in rec_map.items():
                             fname = next((f.name for f in my_funds if f.isin == isin), isin)
-                            with cols[i % 2]:
-                                final_allocs[isin] = st.number_input(f"{fname}", value=float(val), key=f"alloc_{isin}")
+                            final_allocs[isin] = st.number_input(f"{fname} (AI)", value=float(val), key=f"alloc_{isin}")
 
-                        # MANUAL ADD FUNDS
-                        st.markdown("**Add Other Funds**")
-                        existing_isins = list(rec_map.keys())
-                        avail_other = [f for f in my_funds if f.isin not in existing_isins]
+                        # Manual Funds
+                        if st.session_state.selected_extras:
+                            for extra_isin in st.session_state.selected_extras:
+                                fname = next((f.name for f in avail_other if f.isin == extra_isin), extra_isin)
+                                final_allocs[extra_isin] = st.number_input(f"{fname} (You)", value=0.0,
+                                                                           key=f"manual_{extra_isin}")
 
-                        if avail_other:
-                            added_funds = st.multiselect("Select funds to add:",
-                                                         options=[f.isin for f in avail_other],
-                                                         format_func=lambda x: next(
-                                                             (f.name for f in avail_other if f.isin == x), x))
-
-                            for added_isin in added_funds:
-                                fname = next((f.name for f in avail_other if f.isin == added_isin), added_isin)
-                                final_allocs[added_isin] = st.number_input(f"{fname} (Manual Add)", value=0.0,
-                                                                           key=f"manual_{added_isin}")
-
-                        # BUFFER
+                        # Cash/Debt
                         rem = amount - sum(final_allocs.values())
-                        if rem != 0: st.caption(f"Remaining / Overallocated: {rem:,.0f} NOK")
+                        if abs(rem) > 1.0: st.caption(f"Unallocated / Overallocated: {rem:,.0f} NOK")
+
                         c1, c2 = st.columns(2)
                         final_allocs['BANK'] = c1.number_input("Savings", value=max(0.0, rem))
                         final_allocs['DEBT'] = c2.number_input("Debt Paydown", value=0.0)
 
-                        # ACTIONS
                         c_sub1, c_sub2 = st.columns(2)
-                        analyze_clk = c_sub1.form_submit_button("🔎 Analyze My Changes")
+                        analyze_clk = c_sub1.form_submit_button("🔎 Analyze My Strategy")
                         exec_clk = c_sub2.form_submit_button("✅ Execute Investment")
 
                         if analyze_clk:
                             agent = StrategyAgent(gemini_key, ai_model)
                             user_prof = {'tax_residence': st.session_state.residences, 'risk': risk}
+                            curr_port = get_portfolio_context(st.session_state.user_id)
                             with st.spinner("Analyzing custom allocation..."):
-                                analysis = agent.analyze_user_edit(user_prof, final_allocs, my_funds)
+                                analysis = agent.analyze_user_edit(user_prof, final_allocs, my_funds, curr_port)
                                 st.session_state.agent_analysis = analysis
                                 st.rerun()
 
@@ -590,9 +626,9 @@ else:
                             st.success("Executed!")
                             st.session_state.agent_result = None
                             st.session_state.agent_analysis = None
+                            st.session_state.selected_extras = []
                             st.rerun()
 
-                    # SHOW ANALYSIS
                     if st.session_state.agent_analysis:
                         st.markdown("### 🤖 Strategy Critique")
                         st.warning(st.session_state.agent_analysis)
@@ -626,8 +662,12 @@ else:
 
             fund_isins = [x for x in df['ISIN'].unique() if x not in ['BANK', 'DEBT']]
             if fund_isins:
-                sel = st.selectbox("History", fund_isins,
-                                   format_func=lambda x: session.query(FundProfile).filter_by(isin=x).first().name)
+                def get_fund_name_safe(isin_code):
+                    profile = session.query(FundProfile).filter_by(isin=isin_code).first()
+                    return profile.name if profile else f"{isin_code} (Unknown)"
+
+
+                sel = st.selectbox("History", fund_isins, format_func=get_fund_name_safe)
                 fig = plot_history(session, st.session_state.user_id, sel, sym, rate)
                 if fig: st.plotly_chart(fig, use_container_width=True)
 

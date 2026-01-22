@@ -159,7 +159,7 @@ SUGGESTED_FUNDS = [
 # 3. STRATEGY AGENT
 # ==========================================
 class StrategyAgent:
-    def __init__(self, api_key, model_name="gemini-1.5-flash"):
+    def __init__(self, api_key, model_name="gemini-2.5-flash"):
         self.api_key = api_key
         self.model_name = model_name
 
@@ -243,79 +243,94 @@ def register_user(u, p, c):
     return True, "Created."
 
 
+# --- IMPROVED: INTEGRITY & PRICE CHECK ---
+# --- STRICT TICKER-FIRST LOGIC ---
 def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None, manual_isin=None):
     try:
         t = yf.Ticker(ticker)
-        # Check if data exists
+
+        # 1. PRICE HEALTH CHECK
         hist = t.history(period="1mo")
         if hist.empty:
-            return None, f"❌ Yahoo has no data for ticker '{ticker}'. Cannot track price."
+            return None, f"❌ Yahoo has no data for ticker '{ticker}'. Cannot add fund."
 
         i = t.info
-        isin = manual_isin if manual_isin else i.get('isin', ticker)
-        name = i.get('longName', i.get('shortName', ticker))
+
+        # 2. STRICT ISIN COLLECTION
+        # Primary: Get ISIN from Yahoo (The Source of Truth)
+        yahoo_isin = i.get('isin')
+        yahoo_name = i.get('longName', i.get('shortName', ticker))
+
+        final_isin = None
+
+        if yahoo_isin and yahoo_isin.strip():
+            # SUCCESS: Yahoo provided an ISIN. We use it.
+            final_isin = yahoo_isin.strip()
+            # If user provided a manual ISIN that contradicts Yahoo, we ignore the manual one
+            # to ensure the Price (from Yahoo) matches the Asset (ISIN) in our DB.
+        else:
+            # FALLBACK: Yahoo has price data but NO ISIN (rare/obscure funds)
+            # Only in this specific case do we trust the user's manual input.
+            if manual_isin and manual_isin.strip():
+                final_isin = manual_isin.strip()
+            else:
+                # Last Resort: Use Ticker as pseudo-ISIN
+                final_isin = ticker.strip()
+
+        # 3. SAVE TO DB
         reg = "Global"
         if any(x in ticker for x in [".OL", ".PA", ".DE", ".CO", ".ST"]): reg = "EEA"
-        if "US" in isin: reg = "US"
+        if "US" in final_isin: reg = "US"
 
-        prof = FundProfile(isin=isin, ticker=ticker, name=name, category=cat, region=reg)
+        prof = FundProfile(isin=final_isin, ticker=ticker, name=yahoo_name, category=cat, region=reg)
         session.merge(prof)
         session.commit()
+
         if user_id:
-            if not session.query(UserFundSelection).filter_by(user_id=user_id, isin=isin).first():
-                session.add(UserFundSelection(user_id=user_id, isin=isin))
+            if not session.query(UserFundSelection).filter_by(user_id=user_id, isin=final_isin).first():
+                session.add(UserFundSelection(user_id=user_id, isin=final_isin))
                 session.commit()
-        return isin, name
+
+        return final_isin, yahoo_name
     except Exception as e:
-        return None, str(e)
+        return None, f"System Error: {str(e)}"
 
 
 # --- NEW: Specific Historical Fetcher ---
-def ensure_historical_price(isin, target_date):
-    """
-    Specifically fetches data around a target date if missing in DB.
-    """
-    # 1. Check if DB already has a price near this date
-    # Exact match
-    existing = session.query(FundPriceHistory).filter_by(isin=isin, date=target_date).first()
-    if existing: return existing.close_price
-
-    # 2. If not, fetch from Yahoo for a small window around target date
-    prof = session.query(FundProfile).filter_by(isin=isin).first()
-    if not prof: return 1.0
-
-    try:
-        t = yf.Ticker(prof.ticker)
-        # Fetch window: 1 week before to 1 day after to ensure we catch a trading day
-        start_d = target_date - timedelta(days=7)
-        end_d = target_date + timedelta(days=1)
-
-        hist = t.history(start=start_d, end=end_d)
-
-        if not hist.empty:
-            # Save all found dates to DB
-            for d, row in hist.iterrows():
-                # Check if exists
-                if not session.query(FundPriceHistory).filter_by(isin=isin, date=d).first():
-                    session.add(FundPriceHistory(isin=isin, date=d, close_price=row['Close']))
-            session.commit()
-
-            # Return the price closest to target_date (last available in the window)
-            return hist.iloc[-1]['Close']
-
-    except:
-        pass
-
-    # Fallback if Yahoo fails or fund didn't exist then
-    return 1.0
-
-
+# --- SMART UPDATE FUNCTION (OPTIMIZED) ---
 def update_price_history(isin):
-    # Standard update (last 5y) for charts
     p = session.query(FundProfile).filter_by(isin=isin).first()
     if not p: return
+
+    # 1. Check the LATEST date we already have in the database
+    last_rec = session.query(FundPriceHistory).filter_by(isin=isin).order_by(desc(FundPriceHistory.date)).first()
+
     try:
-        hist = yf.Ticker(p.ticker).history(period="5y")
+        t = yf.Ticker(p.ticker)
+        hist = pd.DataFrame()
+
+        # 2. Determine Fetch Strategy
+        if not last_rec:
+            # Case A: No data at all -> Fetch full history (5 years)
+            # st.write("Fetching 5 years")
+            hist = t.history(period="5y")
+        else:
+            # Case B: Data exists -> Check if it's stale
+            # st.write("Fetching since {} until today".format(last_rec.date))
+            last_date_in_db = last_rec.date
+            today = datetime.now().date()
+
+            # If last data is older than today, fetch only the missing delta
+            if last_date_in_db.date() < today:
+                # Start from the day AFTER the last record
+                start_fetch = last_date_in_db + timedelta(days=1)
+                hist = t.history(start=start_fetch)
+            else:
+                # Case C: Data is fresh (today) -> Do nothing (Efficient!)
+                # st.write("Data up to date")
+                return
+
+                # 3. Save new data if any
         if not hist.empty:
             for date, row in hist.iterrows():
                 if not session.query(FundPriceHistory).filter_by(isin=isin, date=date).first():
@@ -324,6 +339,16 @@ def update_price_history(isin):
     except:
         pass
 
+
+#Done: make sure that the prices get updated only if there are not already in the database, update only the missing ones
+#TODO: Close the gap between imported price and time and date and new investment time and date
+
+# --- NEW: AUTO-UPDATE ON LOGIN ---
+def refresh_user_prices(user_id):
+    """Updates prices for all funds in the user's universe."""
+    links = session.query(UserFundSelection).filter_by(user_id=user_id).all()
+    for link in links:
+        update_price_history(link.isin)
 
 def get_latest_price(isin):
     rec = session.query(FundPriceHistory).filter_by(isin=isin).order_by(desc(FundPriceHistory.date)).first()
@@ -497,12 +522,29 @@ if not st.session_state.user_id:
         st.rerun()
 
 else:
+    # --- AUTO-UPDATE TRIGGER ---
+    if 'prices_updated' not in st.session_state:
+        with st.spinner("🔄 Refreshing your fund prices..."):
+            refresh_user_prices(st.session_state.user_id)
+        st.session_state.prices_updated = True
+    # ----------------------------
+
+    #Sidebar
     st.sidebar.title(f"👤 {st.session_state.username}")
-    gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password")
-    ai_model = st.sidebar.text_input("🤖 AI Model", value="gemini-1.5-flash")
+
+    # gemini_key = st.secrets["api_keys"] if "gemini_agent" in st.secrets else
+    # Safe retrieval method
+    # This tries to get the key. If it fails (doesn't exist), it defaults to ""
+    try:
+        gemini_key = st.secrets["api_keys"]["gemini_agent"]
+    except (KeyError, FileNotFoundError):
+        gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password")
+
+    ai_model = st.sidebar.text_input("🤖 AI Model", value="gemini-2.5-flash")
     if st.sidebar.button("Logout"):
         st.session_state.user_id = None
         st.query_params.clear()
+        del st.session_state['prices_updated']  # Reset update trigger
         st.rerun()
 
     st.sidebar.markdown("---")

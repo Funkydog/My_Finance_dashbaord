@@ -1,1 +1,46 @@
+# --- Project Specific ---
 /ai-agent.py
+
+# --- Python Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Distribution / Build ---
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+
+# --- Virtual Environments ---
+# Common names for local virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# --- Testing & Coverage ---
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints
+
+# --- IDEs & Editors (Optional but recommended) ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS Generated Files ---
+.DS_Store
+Thumbs.db
+
+# --- Secrets (VERY IMPORTANT) ---
+.env
+secrets.toml
+.streamlit/secrets.toml

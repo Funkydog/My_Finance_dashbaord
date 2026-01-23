@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
 
 # ==========================================
-# 🧠 AI AGENT CONFIGURATION
+# 🧠 AI AGENT CONFIGURATION (UPDATED)
 # ==========================================
 SYSTEM_PROMPT_TEMPLATE = """
 You are a CFA-certified Private Wealth Manager.
@@ -28,16 +28,15 @@ Allocate **{amount} {currency}** (New Cash) into the available universe.
 **Timing Context:** Analysis Date: {analysis_date}.
 
 **3. MACRO-REGIME FRAMEWORK (The Logic):**
-- **Step A (Identify Regime):** Analyze the current geopolitical situation (wars, supply chains) and economic data (inflation, rates). Classify the current regime:
-    * *Inflationary Growth* (Overweight Commodities/Value)
-    * *Stagflation* (Overweight Cash/Defensives/Gold)
-    * *Disinflationary Growth* (Overweight Tech/Growth)
-    * *Deflationary Bust* (Overweight Bonds/Quality)
-- **Step B (Factor Comparison):** Compare the top funds in the universe "Head-to-Head" based on factors: **Momentum, Value, Quality, Low Volatility**.
-- **Step C (Scenario Analysis):** Your de-risking strategy must account for:
-    * *Scenario 1 (Base Case):* Status Quo.
-    * *Scenario 2 (Bear Case):* Geopolitical escalation or Policy Error.
-    * *Scenario 3 (Bull Case):* Resolution/Soft Landing.
+You have access to REAL-TIME Macro Indicators. Use them to determine the regime.
+**Live Macro Data:**
+{macro_data}
+
+**Regime Classification Rules:**
+- **Inflationary Growth:** 10Y Yields Rising, Oil Rising, SP500 > SMA200. (Action: Overweight Value/Commodities).
+- **Stagflation:** 10Y Yields Rising, GDP/Growth Slowing (or VIX High), Gold Rising. (Action: Overweight Cash/Defensives/Gold).
+- **Disinflationary Growth (Goldilocks):** 10Y Yields Falling/Stable, VIX Low, SP500 > SMA200. (Action: Overweight Tech/Growth).
+- **Deflationary Bust:** 10Y Yields Falling (Flight to Safety), VIX Spiking, SP500 < SMA200. (Action: Overweight Bonds/Quality).
 
 **Strategic Rules:**
 1. **Liquidity Check:** If 'Cash' assets are < 3 months of expenses (approx 60k), prioritize filling the 'Savings' bucket.
@@ -49,7 +48,6 @@ Allocate **{amount} {currency}** (New Cash) into the available universe.
 You have access to the **50-Day Simple Moving Average (SMA)** for each fund. Use **Mean Reversion Theory**:
 - **✅ Good Entry (Buy):** Price is **BELOW** the SMA. The asset is "on sale" relative to its recent trend.
 - **⚠️ Caution (Wait/Drip):** Price is **ABOVE** the SMA (especially > 5% above). The asset is "extended" or "expensive".
-- **Strategy:** If a good fundamental fund is trading **below its SMA**, overweight it in this allocation to capture the rebound.
 
 **Available Funds (Universe):**
 {fund_list_json}
@@ -57,9 +55,9 @@ You have access to the **50-Day Simple Moving Average (SMA)** for each fund. Use
 **Output Format:**
 Respond with a strict JSON object:
 {{
-  "current_regime": "Name of the regime (e.g., Late-Cycle Stagflation)",
+  "current_regime": "Name of the regime (e.g., Disinflationary Growth)",
   "allocations": {{ "ISIN_OR_TICKER": AMOUNT }},
-  "reasoning": "A structured analysis: 1) Why this Regime? 2) Head-to-Head Fund Comparison (e.g., 'Fund A beats Fund B because it has higher Quality factor exposure suitable for this volatility'). 3) Scenario De-risking plan. Then Explain the logic. Mention SPECIFIC technical signals (e.g., 'Allocated more to Fund X because it is trading 3% below its SMA, offering a good technical entry point')."
+  "reasoning": "A structured analysis: 1) Cite specific macro data (e.g. 'With 10Y Yields at X% and Oil falling...'). 2) Explain the Regime choice. 3) Fund Selection: Why these specific funds given the regime and their SMA status."
 }}
 """
 
@@ -186,10 +184,15 @@ class StrategyAgent:
     def get_allocation(self, user_profile, funds, amount, balance_sheet, analysis_date=None):
         target_date = analysis_date if analysis_date else datetime.now()
 
+        # --- NEW: FETCH MACRO DATA ---
+        macro_text = "Data not available (Simulation Mode - Manual Regime Assumption Required)"
+        # Only fetch live macro data if we are NOT in a deep historical backtest
+        if (datetime.now() - target_date).days < 3:
+            macro_text = get_macro_indicators()
+
         funds_context = []
         for f in funds:
             # 1. Fetch Price AT THE TARGET DATE
-            # We look for the closest price <= target_date
             price_rec = session.query(FundPriceHistory).filter(
                 FundPriceHistory.isin == f.isin,
                 FundPriceHistory.date <= target_date
@@ -197,8 +200,7 @@ class StrategyAgent:
 
             curr_p = price_rec.close_price if price_rec else 0.0
 
-            # 2. Calculate SMA-50 using historical window
-            # Get 50 records BEFORE or ON the target date
+            # 2. Calculate SMA-50
             sma_hist = session.query(FundPriceHistory.close_price).filter(
                 FundPriceHistory.isin == f.isin,
                 FundPriceHistory.date <= target_date
@@ -223,6 +225,7 @@ class StrategyAgent:
             total_debt = sum(d['principal'] for d in debts)
             if total_debt > 0: avg_rate = sum(d['principal'] * d['interest_rate'] for d in debts) / total_debt
 
+        # --- UPDATED PROMPT INJECTION ---
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
             amount=amount,
@@ -232,7 +235,8 @@ class StrategyAgent:
             balance_sheet_json=bs_json,
             avg_debt_rate=round(avg_rate, 2),
             fund_list_json=json.dumps(funds_context, indent=2),
-            analysis_date=target_date.strftime('%Y-%m-%d')
+            analysis_date=target_date.strftime('%Y-%m-%d'),
+            macro_data=macro_text  # <--- INJECT MACRO DATA HERE
         )
         return self._call_gemini_json(prompt)
 
@@ -437,10 +441,11 @@ def update_price_history(isin):
 
 
 #Done: make sure that the prices get updated only if there are not already in the database, update only the missing ones
-#TODO: Close the gap between imported price and time and date and new investment time and date
+#Done: Close the gap between imported price and time and date and new investment time and date
 #Done: When backtest is selected, there is an error - the button submit seems not the be working - check cause
 #Done: Show the moving average on the graph
 #Done: Make a logic when price is above moving average give a message alert to the user, and if the moving average is above the envolope recommend not to invest in this fund until the prices are down into the envolope zone
+#TODO: make a warning message if the fund is not updated as of today (due to lack of data from yahoo)
 
 # --- NEW: AUTO-UPDATE ON LOGIN ---
 def refresh_user_prices(user_id):
@@ -557,6 +562,61 @@ def get_safe_fund_name(isin_code):
     p = session.query(FundProfile).filter_by(isin=isin_code).first()
     return p.name if p else f"{isin_code} (Unknown)"
 
+
+# --- NEW: MACRO DATA FETCHER ---
+def get_macro_indicators():
+    """Fetches key economic indicators for AI context."""
+    tickers = {
+        "US 10Y Yield": "^TNX",
+        "Crude Oil": "CL=F",
+        "Gold": "GC=F",
+        "VIX (Volatility)": "^VIX",
+        "S&P 500": "^GSPC"
+    }
+
+    data_summary = []
+
+    try:
+        # Fetch current data for all tickers
+        for name, ticker in tickers.items():
+            t = yf.Ticker(ticker)
+
+            # fast_info is often faster/more reliable for "last price" than history
+            try:
+                price = t.fast_info['last_price']
+            except:
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    price = hist['Close'].iloc[-1]
+                else:
+                    price = 0.0
+
+            # Specific logic for SP500 trend (200 Day SMA)
+            trend_txt = ""
+            if name == "S&P 500":
+                try:
+                    hist_long = t.history(period="1y")
+                    if len(hist_long) > 200:
+                        sma200 = hist_long['Close'].rolling(window=200).mean().iloc[-1]
+                        if price > sma200:
+                            trend_txt = f"(Bullish: Above 200SMA {sma200:.0f})"
+                        else:
+                            trend_txt = f"(Bearish: Below 200SMA {sma200:.0f})"
+                except:
+                    pass
+
+            # Formatting
+            if name == "US 10Y Yield":
+                val_str = f"{price:.2f}%"
+            else:
+                val_str = f"{price:,.2f}"
+
+            data_summary.append(f"- {name}: {val_str} {trend_txt}")
+
+        return "\n".join(data_summary)
+
+    except Exception as e:
+        return f"Error fetching macro data: {str(e)}"
 
 # --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):

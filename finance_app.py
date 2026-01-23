@@ -25,6 +25,19 @@ You are a CFA-certified Private Wealth Manager.
 
 **Investment Goal:**
 Allocate **{amount} {currency}** (New Cash) into the available universe.
+**Timing Context:** Analysis Date: {analysis_date}.
+
+**3. MACRO-REGIME FRAMEWORK (The Logic):**
+- **Step A (Identify Regime):** Analyze the current geopolitical situation (wars, supply chains) and economic data (inflation, rates). Classify the current regime:
+    * *Inflationary Growth* (Overweight Commodities/Value)
+    * *Stagflation* (Overweight Cash/Defensives/Gold)
+    * *Disinflationary Growth* (Overweight Tech/Growth)
+    * *Deflationary Bust* (Overweight Bonds/Quality)
+- **Step B (Factor Comparison):** Compare the top funds in the universe "Head-to-Head" based on factors: **Momentum, Value, Quality, Low Volatility**.
+- **Step C (Scenario Analysis):** Your de-risking strategy must account for:
+    * *Scenario 1 (Base Case):* Status Quo.
+    * *Scenario 2 (Bear Case):* Geopolitical escalation or Policy Error.
+    * *Scenario 3 (Bull Case):* Resolution/Soft Landing.
 
 **Strategic Rules:**
 1. **Liquidity Check:** If 'Cash' assets are < 3 months of expenses (approx 60k), prioritize filling the 'Savings' bucket.
@@ -32,14 +45,21 @@ Allocate **{amount} {currency}** (New Cash) into the available universe.
 3. **Diversification:** Consider the user's *Total* Net Worth. If they are heavy in Real Estate, prioritize liquid global equities.
 4. **Tax Efficiency:** Norway (ASK), France (PEA), USA (No PFIC).
 
+**Tactical Rules (Moving Average Logic):**
+You have access to the **50-Day Simple Moving Average (SMA)** for each fund. Use **Mean Reversion Theory**:
+- **✅ Good Entry (Buy):** Price is **BELOW** the SMA. The asset is "on sale" relative to its recent trend.
+- **⚠️ Caution (Wait/Drip):** Price is **ABOVE** the SMA (especially > 5% above). The asset is "extended" or "expensive".
+- **Strategy:** If a good fundamental fund is trading **below its SMA**, overweight it in this allocation to capture the rebound.
+
 **Available Funds (Universe):**
 {fund_list_json}
 
 **Output Format:**
 Respond with a strict JSON object:
 {{
+  "current_regime": "Name of the regime (e.g., Late-Cycle Stagflation)",
   "allocations": {{ "ISIN_OR_TICKER": AMOUNT }},
-  "reasoning": "Strategic explanation based on Total Net Worth and Debt profile."
+  "reasoning": "A structured analysis: 1) Why this Regime? 2) Head-to-Head Fund Comparison (e.g., 'Fund A beats Fund B because it has higher Quality factor exposure suitable for this volatility'). 3) Scenario De-risking plan. Then Explain the logic. Mention SPECIFIC technical signals (e.g., 'Allocated more to Fund X because it is trading 3% below its SMA, offering a good technical entry point')."
 }}
 """
 
@@ -159,20 +179,49 @@ SUGGESTED_FUNDS = [
 # 3. STRATEGY AGENT
 # ==========================================
 class StrategyAgent:
-    def __init__(self, api_key, model_name="gemini-2.5-flash"):
+    def __init__(self, api_key, model_name="gemini-2.5-flash-lite"):
         self.api_key = api_key
         self.model_name = model_name
 
-    def get_allocation(self, user_profile, funds, amount, balance_sheet):
-        funds_context = [{"isin": f.isin, "name": f.name, "region": f.region, "category": f.category} for f in funds]
-        bs_json = json.dumps(balance_sheet, indent=2)
+    def get_allocation(self, user_profile, funds, amount, balance_sheet, analysis_date=None):
+        target_date = analysis_date if analysis_date else datetime.now()
 
+        funds_context = []
+        for f in funds:
+            # 1. Fetch Price AT THE TARGET DATE
+            # We look for the closest price <= target_date
+            price_rec = session.query(FundPriceHistory).filter(
+                FundPriceHistory.isin == f.isin,
+                FundPriceHistory.date <= target_date
+            ).order_by(desc(FundPriceHistory.date)).first()
+
+            curr_p = price_rec.close_price if price_rec else 0.0
+
+            # 2. Calculate SMA-50 using historical window
+            # Get 50 records BEFORE or ON the target date
+            sma_hist = session.query(FundPriceHistory.close_price).filter(
+                FundPriceHistory.isin == f.isin,
+                FundPriceHistory.date <= target_date
+            ).order_by(desc(FundPriceHistory.date)).limit(50).all()
+
+            trend = "No Data"
+            if len(sma_hist) >= 10:
+                sma = sum([h[0] for h in sma_hist]) / len(sma_hist)
+                if curr_p > 0:
+                    diff = ((curr_p - sma) / sma) * 100
+                    trend = f"{diff:+.1f}% vs SMA50 (on {target_date.strftime('%Y-%m-%d')})"
+
+            funds_context.append({
+                "isin": f.isin, "name": f.name, "cat": f.category,
+                "price": curr_p, "trend": trend
+            })
+
+        bs_json = json.dumps(balance_sheet, indent=2)
         debts = balance_sheet.get('liabilities', [])
         avg_rate = 0.0
         if debts:
             total_debt = sum(d['principal'] for d in debts)
-            if total_debt > 0:
-                avg_rate = sum(d['principal'] * d['interest_rate'] for d in debts) / total_debt
+            if total_debt > 0: avg_rate = sum(d['principal'] * d['interest_rate'] for d in debts) / total_debt
 
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
@@ -182,7 +231,8 @@ class StrategyAgent:
             monthly_savings=user_profile.get('monthly_savings', 0),
             balance_sheet_json=bs_json,
             avg_debt_rate=round(avg_rate, 2),
-            fund_list_json=json.dumps(funds_context, indent=2)
+            fund_list_json=json.dumps(funds_context, indent=2),
+            analysis_date=target_date.strftime('%Y-%m-%d')
         )
         return self._call_gemini_json(prompt)
 
@@ -202,15 +252,16 @@ class StrategyAgent:
         return self._call_gemini_text(prompt)
 
     def _call_gemini_json(self, prompt):
-        if not self.api_key: return {}, "⚠️ No API Key."
+        if not self.api_key: return {}, {}, "⚠️ No API Key."
         try:
             genai.configure(api_key=self.api_key)
             model = genai.GenerativeModel(self.model_name)
             response = model.generate_content(prompt)
             clean = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean).get('allocations', {}), json.loads(clean).get('reasoning', "")
+            res = json.loads(clean)
+            return res.get('allocations', {}), res.get('current_regime', "Unknown"), res.get('reasoning', "")
         except Exception as e:
-            return {}, f"AI Error: {str(e)}"
+            return {}, "Error", f"AI Error: {str(e)}"
 
     def _call_gemini_text(self, prompt):
         if not self.api_key: return "⚠️ No API Key."
@@ -296,6 +347,51 @@ def fetch_and_save_fund_profile(ticker, cat="Custom", user_id=None, manual_isin=
         return None, f"System Error: {str(e)}"
 
 
+# --- UPDATED: Ensure 3 Months of History for Proper SMA ---
+def ensure_historical_data_for_sma(isin, target_date):
+    """Fetches enough historical data (3 months back) to calculate SMA-50 for the target date."""
+
+    # 1. Check if we already have the specific target date price
+    existing = session.query(FundPriceHistory).filter_by(isin=isin, date=target_date).first()
+
+    # 2. Check if we have the 50 days prior (approx)
+    start_window = target_date - timedelta(days=90)  # 3 months buffer
+    prior_count = session.query(FundPriceHistory).filter(
+        FundPriceHistory.isin == isin,
+        FundPriceHistory.date >= start_window,
+        FundPriceHistory.date <= target_date
+    ).count()
+
+    # If we have the price AND enough context, we are good
+    if existing and prior_count >= 40:
+        return existing.close_price
+
+    # Otherwise, fetch from Yahoo
+    prof = session.query(FundProfile).filter_by(isin=isin).first()
+    if not prof: return 1.0
+
+    try:
+        t = yf.Ticker(prof.ticker)
+        # Fetch 3 months before to 1 day after
+        end_d = target_date + timedelta(days=1)
+        hist = t.history(start=start_window, end=end_d)
+
+        if not hist.empty:
+            for d, row in hist.iterrows():
+                if not session.query(FundPriceHistory).filter_by(isin=isin, date=d).first():
+                    session.add(FundPriceHistory(isin=isin, date=d, close_price=row['Close']))
+            session.commit()
+
+            # Return the specific price for target date (or closest before it)
+            closest_idx = hist.index.get_indexer([target_date], method='pad')[0]
+            if closest_idx != -1:
+                return hist.iloc[closest_idx]['Close']
+
+    except:
+        pass
+    return 1.0
+
+
 # --- NEW: Specific Historical Fetcher ---
 # --- SMART UPDATE FUNCTION (OPTIMIZED) ---
 def update_price_history(isin):
@@ -342,6 +438,9 @@ def update_price_history(isin):
 
 #Done: make sure that the prices get updated only if there are not already in the database, update only the missing ones
 #TODO: Close the gap between imported price and time and date and new investment time and date
+#Done: When backtest is selected, there is an error - the button submit seems not the be working - check cause
+#Done: Show the moving average on the graph
+#Done: Make a logic when price is above moving average give a message alert to the user, and if the moving average is above the envolope recommend not to invest in this fund until the prices are down into the envolope zone
 
 # --- NEW: AUTO-UPDATE ON LOGIN ---
 def refresh_user_prices(user_id):
@@ -355,31 +454,41 @@ def get_latest_price(isin):
     return rec.close_price if rec else 1.0
 
 
+# --- UPDATED: Smart Date Alignment ---
 def log_investment(user_id, amount, isin, alloc_type, risk, date_override=None, manual_price_override=None):
-    d = datetime.now()
-    if date_override:
-        d = datetime.combine(date_override, datetime.min.time())
-
-    p = 1.0
+    transaction_date = datetime.now()
+    final_price = 1.0
 
     if isin not in ['BANK', 'DEBT']:
-        # Priority 1: User Manual Price
-        if manual_price_override and manual_price_override > 0:
-            p = manual_price_override
-        # Priority 2: Historical Fetch (Backtest)
-        elif date_override:
-            p = ensure_historical_price(isin, d)
-            # If ensure_historical returns 1.0 (failure), try latest as last resort or keep 1.0
-            if p == 1.0:
-                p = get_latest_price(isin)
-        # Priority 3: Live Price
-        else:
-            update_price_history(isin)
-            p = get_latest_price(isin)
+        # Case A: Backtest (User set a date)
+        if date_override:
+            transaction_date = datetime.combine(date_override, datetime.min.time())
+            if manual_price_override and manual_price_override > 0:
+                final_price = manual_price_override
+            else:
+                final_price = ensure_historical_data_for_sma(isin, transaction_date)
+                if final_price == 1.0: final_price = get_latest_price(isin)
 
-    session.add(
-        FinancialRecord(user_id=user_id, date=d, year=d.year, amount=amount, allocation_type=alloc_type, isin=isin,
-                        entry_price=p, units_owned=amount / p, risk_score=risk))
+        # Case B: Live (Snap to latest market data)
+        else:
+            # 1. Ensure latest data
+            update_price_history(isin)
+            # 2. Get latest record from DB
+            latest_rec = session.query(FundPriceHistory).filter_by(isin=isin).order_by(
+                desc(FundPriceHistory.date)).first()
+            if latest_rec:
+                transaction_date = latest_rec.date  # SNAP TO MARKET DATE
+                final_price = latest_rec.close_price
+            else:
+                final_price = 1.0
+
+            # Allow manual override even in Live mode
+            if manual_price_override and manual_price_override > 0:
+                final_price = manual_price_override
+
+    session.add(FinancialRecord(user_id=user_id, date=transaction_date, year=transaction_date.year, amount=amount,
+                                allocation_type=alloc_type, isin=isin, entry_price=final_price,
+                                units_owned=amount / final_price if final_price else 0, risk_score=risk))
     session.commit()
 
 
@@ -443,7 +552,13 @@ def get_exchange_rates():
     except:
         return {'EUR': 11.5, 'USD': 10.5}
 
+def get_safe_fund_name(isin_code):
+    """Global helper prevents widget reset."""
+    p = session.query(FundProfile).filter_by(isin=isin_code).first()
+    return p.name if p else f"{isin_code} (Unknown)"
 
+
+# --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):
     # 1. Fetch History
     hist = session.query(FundPriceHistory).filter_by(isin=isin).order_by(FundPriceHistory.date).all()
@@ -451,26 +566,54 @@ def plot_history(session, user_id, isin, currency_sym, rate):
     prof = session.query(FundProfile).filter_by(isin=isin).first()
     name = prof.name if prof else isin
 
+    # Create DataFrame
     df_h = pd.DataFrame([{"Date": h.date, "Price": h.close_price / rate} for h in hist])
+    if df_h.empty: return None
+
+    # --- CALC INDICATORS ---
+    # Moving Average (Simple, Period 50)
+    df_h['SMA_50'] = df_h['Price'].rolling(window=50).mean()
+    # Envelope (Percent, Shift 5%)
+    df_h['Upper_Env'] = df_h['SMA_50'] * 1.05
+    df_h['Lower_Env'] = df_h['SMA_50'] * 0.95
 
     # 2. Fetch User Investments
     investments = session.query(FinancialRecord).filter_by(isin=isin, user_id=user_id).all()
     df_inv = pd.DataFrame(
         [{"Date": i.date, "Price": i.entry_price / rate, "Amt": i.amount / rate} for i in investments])
 
+    # 3. Create Plot
     fig = px.line(df_h, x="Date", y="Price", title=f"{name} ({currency_sym})")
 
-    # 3. Add User Markers
+    # Add SMA Trace
+    fig.add_trace(go.Scatter(x=df_h["Date"], y=df_h["SMA_50"], name="SMA (50)", line=dict(color='orange', width=1.5)))
+
+    # Add Upper/Lower Envelope Traces
+    # Upper
+    fig.add_trace(go.Scatter(x=df_h["Date"], y=df_h["Upper_Env"], name="Upper Env (+5%)",
+                             line=dict(color='gray', width=1, dash='dash')))
+    # Lower (with Fill to Upper for visual envelope)
+    fig.add_trace(go.Scatter(
+        x=df_h["Date"], y=df_h["Lower_Env"], name="Lower Env (-5%)",
+        line=dict(color='gray', width=1, dash='dash'),
+        fill='tonexty',  # Fills to the previous trace (Upper Env)
+        fillcolor='rgba(200, 200, 200, 0.1)'  # Light gray transparent fill
+    ))
+
+    # Add Investment Markers
     if not df_inv.empty:
         fig.add_trace(go.Scatter(
             x=df_inv["Date"],
             y=df_inv["Price"],
             mode='markers+text',
-            marker=dict(size=14, color='Gold', symbol='star'),
+            marker=dict(size=14, color='Gold', symbol='star', line=dict(width=1, color='black')),
             text=[f"{a:,.0f}{currency_sym}" for a in df_inv["Amt"]],
             textposition="top center",
-            textfont=dict(color='black')
+            textfont=dict(color='white'),
+            name="Your Buy"
         ))
+
+    fig.update_layout(template="plotly_white")
     return fig
 
 
@@ -522,29 +665,22 @@ if not st.session_state.user_id:
         st.rerun()
 
 else:
-    # --- AUTO-UPDATE TRIGGER ---
     if 'prices_updated' not in st.session_state:
-        with st.spinner("🔄 Refreshing your fund prices..."):
+        with st.spinner("🔄 Checking for new price data..."):
             refresh_user_prices(st.session_state.user_id)
         st.session_state.prices_updated = True
-    # ----------------------------
 
-    #Sidebar
     st.sidebar.title(f"👤 {st.session_state.username}")
-
-    # gemini_key = st.secrets["api_keys"] if "gemini_agent" in st.secrets else
-    # Safe retrieval method
-    # This tries to get the key. If it fails (doesn't exist), it defaults to ""
     try:
         gemini_key = st.secrets["api_keys"]["gemini_agent"]
-    except (KeyError, FileNotFoundError):
+    except:
         gemini_key = st.sidebar.text_input("🔑 Gemini API Key", type="password")
 
-    ai_model = st.sidebar.text_input("🤖 AI Model", value="gemini-2.5-flash")
+    ai_model = st.sidebar.text_input("🤖 AI Model", value="gemini-2.5-flash-lite")
     if st.sidebar.button("Logout"):
         st.session_state.user_id = None
         st.query_params.clear()
-        del st.session_state['prices_updated']  # Reset update trigger
+        del st.session_state['prices_updated']
         st.rerun()
 
     st.sidebar.markdown("---")
@@ -572,12 +708,11 @@ else:
                         st.error(res_msg)
             else:
                 c2.caption("✅")
-
     with sb_tab2:
         with st.sidebar.form("manual_add"):
-            st.info("Ensure the Ticker exists on Yahoo Finance.")
+            st.info("Yahoo Ticker is the Source of Truth.")
             m_tick = st.text_input("Yahoo Ticker")
-            m_isin = st.text_input("ISIN Code")
+            m_isin = st.text_input("ISIN (Optional)")
             m_cat = st.selectbox("Category", ["Global", "Nordic", "Tech"])
             if st.form_submit_button("Add"):
                 res_isin, res_msg = fetch_and_save_fund_profile(m_tick, m_cat, st.session_state.user_id,
@@ -589,9 +724,43 @@ else:
                 else:
                     st.error(res_msg)
 
-    tab1, tab2, tab3 = st.tabs(["👤 Profile", "🧠 Strategy", "📊 Portfolio"])
+    # --- NAVIGATION ---
+    TAB_NAMES = ["👤 Profile", "🧠 AI Strategy", "📊 Portfolio"]
 
-    with tab1:
+    default_index = 0
+    if "tab" in st.query_params:
+        try:
+            url_tab_name = st.query_params["tab"]
+            if url_tab_name in TAB_NAMES:
+                default_index = TAB_NAMES.index(url_tab_name)
+        except:
+            pass
+
+    # Custom Tabs Style
+    st.markdown("""
+        <style>
+            div.row-widget.stRadio > div{flex-direction:row;}
+            div.row-widget.stRadio > div > label{
+                background-color: #f0f2f6; padding: 10px 20px; border-radius: 5px 5px 0 0; 
+                margin-right: 2px; border: 1px solid #ddd; border-bottom: none; cursor: pointer;
+            }
+            div.row-widget.stRadio > div > label[data-baseweb="radio"] {
+                background-color: white; border-bottom: 2px solid #ff4b4b;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+
+    selected_tab = st.radio("Main Navigation", TAB_NAMES, index=default_index, horizontal=True,
+                            label_visibility="collapsed", key="main_nav_radio")
+
+    # Sync URL if changed by click
+    if selected_tab != st.query_params.get("tab", TAB_NAMES[0]):
+        st.query_params["tab"] = selected_tab
+        st.rerun()
+
+    st.markdown("---")
+
+    if selected_tab == "👤 Profile":
         st.header("Financial Identity")
         col_a, col_b = st.columns(2)
         with col_a:
@@ -646,7 +815,7 @@ else:
                     session.commit();
                     st.rerun()
 
-    with tab2:
+    elif selected_tab == "🧠 AI Strategy":
         st.subheader("AI Portfolio Architect")
         links = session.query(UserFundSelection).filter_by(user_id=st.session_state.user_id).all()
         my_funds = session.query(FundProfile).filter(FundProfile.isin.in_([l.isin for l in links])).all()
@@ -674,14 +843,18 @@ else:
                                      'monthly_savings': session.query(User).get(
                                          st.session_state.user_id).monthly_savings_capacity}
                         bs = get_balance_sheet(st.session_state.user_id)
-                        with st.spinner("Analyzing Balance Sheet..."):
-                            rec_map, reasoning = agent.get_allocation(user_prof, my_funds, amount, bs)
-                            st.session_state.agent_result = {'allocs': rec_map, 'reasoning': reasoning}
+                        analysis_d = datetime.combine(sim_date, datetime.min.time()) if sim_date else datetime.now()
+                        with st.spinner("Analyzing Macro Regime..."):
+                            rec_map, regime, reasoning = agent.get_allocation(user_prof, my_funds, amount, bs,
+                                                                              analysis_date=analysis_d)
+                            st.session_state.agent_result = {'allocs': rec_map, 'regime': regime,
+                                                             'reasoning': reasoning}
                             st.rerun()
 
             if st.session_state.agent_result:
                 res = st.session_state.agent_result
-                st.info(f"**AI Strategy:** {res['reasoning']}")
+                st.success(f"**Current Regime:** {res['regime']}")
+                st.info(f"**Analysis:** {res['reasoning']}")
                 if st.button("🔄 Reset"): st.session_state.agent_result = None; st.rerun()
 
                 rec_map = res['allocs']
@@ -694,44 +867,35 @@ else:
 
                 with st.form("agent_exec"):
                     final_allocs = {}
-                    final_prices = {}  # Store override prices
-
-                    st.markdown("**Allocation (Verify Price)**")
-
-                    # 1. AI FUNDS
+                    final_prices = {}
+                    st.markdown("**Allocation**")
                     for isin, val in rec_map.items():
                         fname = next((f.name for f in my_funds if f.isin == isin), isin)
                         c1, c2 = st.columns([2, 1])
                         final_allocs[isin] = c1.number_input(f"{fname} (AI)", value=float(val), key=f"a_{isin}")
-                        # SMART PRICE CHECK: If Backtest, fetch historical NOW for display
                         display_p = 1.0
+                        d_context = datetime.combine(sim_date, datetime.min.time()) if sim_date else datetime.now()
                         if sim_date:
-                            display_p = ensure_historical_price(isin, datetime.combine(sim_date, datetime.min.time()))
+                            display_p = ensure_historical_data_for_sma(isin, d_context)
                         else:
                             display_p = get_latest_price(isin)
+                        final_prices[isin] = c2.number_input(f"Price {isin}", value=float(display_p), key=f"p_{isin}")
 
-                        final_prices[isin] = c2.number_input(f"Price {isin}", value=float(display_p), key=f"p_{isin}",
-                                                             help="Correct if needed")
-
-                    # 2. MANUAL FUNDS
                     for extra_isin in st.session_state.selected_extras:
                         fname = next((f.name for f in avail_other if f.isin == extra_isin), extra_isin)
                         c1, c2 = st.columns([2, 1])
                         final_allocs[extra_isin] = c1.number_input(f"{fname} (You)", value=0.0, key=f"ma_{extra_isin}")
-
                         display_p = 1.0
+                        d_context = datetime.combine(sim_date, datetime.min.time()) if sim_date else datetime.now()
                         if sim_date:
-                            display_p = ensure_historical_price(extra_isin,
-                                                                datetime.combine(sim_date, datetime.min.time()))
+                            display_p = ensure_historical_data_for_sma(extra_isin, d_context)
                         else:
                             display_p = get_latest_price(extra_isin)
-
                         final_prices[extra_isin] = c2.number_input(f"Price {extra_isin}", value=float(display_p),
-                                                                   key=f"mp_{extra_isin}", help="Correct if needed")
+                                                                   key=f"mp_{extra_isin}")
 
                     rem = amount - sum(final_allocs.values())
                     st.caption(f"Unallocated: {rem:,.0f}")
-
                     c1, c2 = st.columns(2)
                     final_allocs['BANK'] = c1.number_input("Savings", value=max(0.0, rem))
                     final_allocs['DEBT'] = c2.number_input("Debt Paydown", value=0.0)
@@ -754,9 +918,13 @@ else:
                         st.success("Executed!")
                         st.session_state.agent_result = None
                         st.session_state.selected_extras = []
+
+                        # --- REDIRECTION FIX ---
+                        # st.session_state.main_nav_radio = "📊 Portfolio"  # Force radio state
+                        st.query_params["tab"] = "📊 Portfolio"  # Sync URL
                         st.rerun()
 
-    with tab3:
+    elif selected_tab == "📊 Portfolio":
         bs = get_balance_sheet(st.session_state.user_id)
         total_assets = sum(a['value'] for a in bs['assets']) + bs['market_portfolio_total']
         total_liab = sum(l['principal'] for l in bs['liabilities'])
@@ -777,23 +945,13 @@ else:
 
         st.markdown("---")
         st.subheader("Market Portfolio Performance")
-
         df_p = get_portfolio_df(st.session_state.user_id)
-
         if not df_p.empty:
-            edited_df = st.data_editor(
-                df_p,
-                column_config={
-                    "Delete?": st.column_config.CheckboxColumn("Remove", default=False),
-                    "ID": st.column_config.NumberColumn(disabled=True),
-                    "Allocation": st.column_config.TextColumn(disabled=True),
-                    "Invested": st.column_config.NumberColumn(format="%.0f", disabled=True),
-                    "Entry Price": st.column_config.NumberColumn(format="%.2f", disabled=True)
-                },
-                disabled=["ID", "Allocation", "ISIN", "Date", "Invested", "Current Value", "Profit", "Entry Price"],
-                hide_index=True,
-            )
-
+            edited_df = st.data_editor(df_p, column_config={
+                "Delete?": st.column_config.CheckboxColumn("Remove", default=False),
+                "ID": st.column_config.NumberColumn(disabled=True)},
+                                       disabled=["ID", "Allocation", "ISIN", "Date", "Invested", "Current Value",
+                                                 "Profit", "Entry Price"], hide_index=True)
             to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
             if to_delete_ids:
                 if st.button(f"🗑️ Delete Selected Rows ({len(to_delete_ids)})"):
@@ -801,14 +959,10 @@ else:
                     st.success("Deleted!")
                     st.rerun()
 
-            fund_isins = [x for x in df_p['ISIN'].unique() if x not in ['BANK', 'DEBT']]
+            fund_isins = sorted([x for x in df_p['ISIN'].unique() if x not in ['BANK', 'DEBT']])
             if fund_isins:
-                def get_safe_name(i):
-                    p = session.query(FundProfile).filter_by(isin=i).first()
-                    return p.name if p else i
-
-
-                sel = st.selectbox("Chart Fund", fund_isins, format_func=get_safe_name)
+                sel = st.selectbox("Chart Fund", fund_isins, format_func=get_safe_fund_name,
+                                   key="portfolio_chart_select")
                 fig = plot_history(session, st.session_state.user_id, sel, "kr", 1.0)
                 if fig: st.plotly_chart(fig)
         else:

@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np # Ensure numpy is imported
 import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
@@ -532,20 +533,38 @@ def get_balance_sheet(user_id):
 def get_portfolio_df(user_id):
     recs = session.query(FinancialRecord).filter_by(user_id=user_id).order_by(desc(FinancialRecord.date)).all()
     data = []
+
     for r in recs:
         p = 1.0
         name = r.allocation_type
+        vol = 0.0
+        dd = 0.0
+
+        # Only calculate risk for actual Funds (skip Bank/Debt)
         if r.isin not in ['BANK', 'DEBT']:
             p = get_latest_price(r.isin)
             prof = session.query(FundProfile).filter_by(isin=r.isin).first()
             if prof: name = prof.name
+
+            # --- CALL RISK CALCULATOR ---
+            vol, dd = calculate_risk_metrics(r.isin)
+
+        curr_val = r.units_owned * p
+        profit = curr_val - r.amount
+
         data.append({
             "ID": r.id,
             "Delete?": False,
-            "Allocation": name, "ISIN": r.isin, "Date": r.date.date(),
-            "Invested": r.amount, "Current Value": r.units_owned * p,
-            "Profit": (r.units_owned * p) - r.amount, "Entry Price": r.entry_price
+            "Allocation": name,
+            "ISIN": r.isin,
+            "Date": r.date.date(),
+            "Invested": r.amount,
+            "Current Value": curr_val,
+            "Profit": profit,
+            "Volatility": vol / 100,  # Store as float for formatting (e.g. 0.15 for 15%)
+            "Max Drawdown": dd / 100  # Store as float (e.g. -0.20 for -20%)
         })
+
     return pd.DataFrame(data)
 
 
@@ -617,6 +636,46 @@ def get_macro_indicators():
 
     except Exception as e:
         return f"Error fetching macro data: {str(e)}"
+
+
+
+def calculate_risk_metrics(isin):
+    """
+    Calculates 1-Year Max Drawdown and Annualized Volatility.
+    Returns: (volatility_pct, max_drawdown_pct)
+    """
+    # 1. Fetch last 1 year of data (approx 260 trading days)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365)
+
+    hist = session.query(FundPriceHistory.close_price).filter(
+        FundPriceHistory.isin == isin,
+        FundPriceHistory.date >= start_date
+    ).order_by(FundPriceHistory.date).all()
+
+    prices = [h[0] for h in hist]
+
+    if len(prices) < 30:  # Not enough data
+        return 0.0, 0.0
+
+    # 2. Prepare Data
+    price_series = pd.Series(prices)
+
+    # 3. Calculate Volatility (Standard Deviation of Daily Returns * sqrt(252))
+    returns = price_series.pct_change().dropna()
+    if returns.empty: return 0.0, 0.0
+
+    volatility = returns.std() * np.sqrt(252) * 100  # Annualized %
+
+    # 4. Calculate Max Drawdown
+    # Calculate rolling maximum (Peak)
+    rolling_max = price_series.cummax()
+    # Calculate drawdown relative to peak
+    drawdown = (price_series - rolling_max) / rolling_max
+    # The minimum value is the Maximum Drawdown
+    max_dd = drawdown.min() * 100
+
+    return round(volatility, 1), round(max_dd, 1)
 
 # --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):
@@ -1006,19 +1065,56 @@ else:
         st.markdown("---")
         st.subheader("Market Portfolio Performance")
         df_p = get_portfolio_df(st.session_state.user_id)
-        if not df_p.empty:
-            edited_df = st.data_editor(df_p, column_config={
-                "Delete?": st.column_config.CheckboxColumn("Remove", default=False),
-                "ID": st.column_config.NumberColumn(disabled=True)},
-                                       disabled=["ID", "Allocation", "ISIN", "Date", "Invested", "Current Value",
-                                                 "Profit", "Entry Price"], hide_index=True)
-            to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
-            if to_delete_ids:
-                if st.button(f"🗑️ Delete Selected Rows ({len(to_delete_ids)})"):
-                    delete_transactions(to_delete_ids)
-                    st.success("Deleted!")
-                    st.rerun()
 
+        if not df_p.empty:
+            # --- VIEW 1: RISK & PERFORMANCE DASHBOARD (Styled) ---
+            st.caption("Risk Analysis (Red highlight = Drawdown > 20%)")
+
+
+            # Define styling logic
+            def highlight_risk(row):
+                # If Max Drawdown is worse than -20% (e.g., -0.25), color red
+                if row['Max Drawdown'] < -0.20:
+                    return ['background-color: #ffcccc; color: #990000'] * len(row)
+                return [''] * len(row)
+
+
+            # Apply style and formatting
+            styled_df = df_p.style.apply(highlight_risk, axis=1).format({
+                "Invested": "{:,.0f}",
+                "Current Value": "{:,.0f}",
+                "Profit": "{:+,.0f}",
+                "Volatility": "{:.1%}",  # Formats 0.15 as 15.0%
+                "Max Drawdown": "{:.1%}"  # Formats -0.20 as -20.0%
+            })
+
+            # Render the styled dataframe
+            st.dataframe(styled_df, column_config={
+                "ID": None, "Delete?": None  # Hide utility columns in this view
+            }, use_container_width=True)
+
+            # --- VIEW 2: MANAGEMENT (Delete Rows) ---
+            with st.expander("🛠️ Manage Transactions (Delete)"):
+                edited_df = st.data_editor(
+                    df_p,
+                    column_config={
+                        "Delete?": st.column_config.CheckboxColumn("Delete", default=False),
+                        "ID": None,  # Hide ID
+                        "Volatility": None,  # Hide Risk metrics in edit mode to save space
+                        "Max Drawdown": None
+                    },
+                    disabled=["Allocation", "ISIN", "Date", "Invested", "Current Value", "Profit"],
+                    hide_index=True
+                )
+
+                to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
+                if to_delete_ids:
+                    if st.button(f"🗑️ Delete Selected Rows ({len(to_delete_ids)})"):
+                        delete_transactions(to_delete_ids)
+                        st.success("Deleted!")
+                        st.rerun()
+
+            # --- CHARTING ---
             fund_isins = sorted([x for x in df_p['ISIN'].unique() if x not in ['BANK', 'DEBT']])
             if fund_isins:
                 sel = st.selectbox("Chart Fund", fund_isins, format_func=get_safe_fund_name,

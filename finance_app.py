@@ -24,6 +24,14 @@ You are a CFA-certified Private Wealth Manager.
 **Balance Sheet Context:**
 {balance_sheet_json}
 
+**Current Portfolio Exposure (REBALANCING LOGIC):**
+{portfolio_exposure}
+**Rebalancing Rule:**
+Compare the 'Current Exposure' above to the client's Risk Profile ({risk_profile}).
+- If they are **Overweight** in a category (e.g., >70% in Growth), DO NOT allocate new cash there.
+- Prioritize **Underweighted** categories to bring them closer to target.
+- Explicitly state: "Allocating to [Category] to rebalance your underweight exposure.
+
 **Investment Goal:**
 Allocate **{amount} {currency}** (New Cash) into the available universe.
 **Timing Context:** Analysis Date: {analysis_date}.
@@ -173,6 +181,29 @@ SUGGESTED_FUNDS = [
     {"ticker": "NOVO-B.CO", "cat": "Health", "name": "Novo Nordisk", "countries": ["Denmark", "Global"]},
 ]
 
+# ==========================================
+# 2b. REBALANCING CONFIGURATION
+# ==========================================
+# 1. Target Weights per Risk Profile
+RISK_MODELS = {
+    "Conservative": {"Defensive": 0.50, "Growth": 0.20, "Cash": 0.30},
+    "Moderate":     {"Defensive": 0.35, "Growth": 0.45, "Cash": 0.20},
+    "Growth":       {"Defensive": 0.15, "Growth": 0.75, "Cash": 0.10},
+    "Aggressive":   {"Defensive": 0.05, "Growth": 0.90, "Cash": 0.05}
+}
+
+# 2. Map Fund Categories to Macro Buckets
+# (Adjust these keys based on the categories you use in your app)
+CATEGORY_MAP = {
+    "Tech": "Growth", "Global": "Growth", "Seafood": "Growth", "USA": "Growth",
+    "Health": "Defensive", "Energy": "Defensive", "Norwegian": "Defensive",
+    "Bonds": "Defensive", "Bank": "Cash", "Cash": "Cash"
+}
+
+def get_bucket(cat_name):
+    """Maps a specific fund category (e.g., 'Tech') to a Macro Bucket (e.g., 'Growth')."""
+    return CATEGORY_MAP.get(cat_name, "Growth") # Default to Growth if unknown
+
 
 # ==========================================
 # 3. STRATEGY AGENT
@@ -190,6 +221,15 @@ class StrategyAgent:
         # Only fetch live macro data if we are NOT in a deep historical backtest
         if (datetime.now() - target_date).days < 3:
             macro_text = get_macro_indicators()
+
+        # --- NEW: CALCULATE EXPOSURE ---
+        # We need the user ID to fetch the portfolio.
+        # Assuming you pass 'user_id' in user_profile or we fetch it from session outside.
+        # For this function, let's assume user_profile has 'user_id'
+        cur_exp, tot_val = get_portfolio_exposure(user_profile.get('user_id'))
+
+        # Format for AI
+        exp_str = json.dumps(cur_exp, indent=2)
 
         funds_context = []
         for f in funds:
@@ -234,10 +274,11 @@ class StrategyAgent:
             risk_profile=user_profile.get('risk', 'Growth'),
             monthly_savings=user_profile.get('monthly_savings', 0),
             balance_sheet_json=bs_json,
+            portfolio_exposure=exp_str,  # <--- INJECT EXPOSURE HERE
             avg_debt_rate=round(avg_rate, 2),
             fund_list_json=json.dumps(funds_context, indent=2),
             analysis_date=target_date.strftime('%Y-%m-%d'),
-            macro_data=macro_text  # <--- INJECT MACRO DATA HERE
+            macro_data=macro_text
         )
         return self._call_gemini_json(prompt)
 
@@ -677,6 +718,44 @@ def calculate_risk_metrics(isin):
 
     return round(volatility, 1), round(max_dd, 1)
 
+
+def get_portfolio_exposure(user_id):
+    """Calculates the current % allocation of the user's total net worth."""
+    # 1. Get Balance Sheet
+    bs = get_balance_sheet(user_id)
+    total_val = bs['market_portfolio_total'] + sum(a['value'] for a in bs['assets'])
+
+    if total_val == 0: return {}, 0
+
+    # 2. Group Market Holdings
+    current_counts = {"Growth": 0.0, "Defensive": 0.0, "Cash": 0.0}
+
+    # A. Funds in Portfolio
+    recs = session.query(FinancialRecord).filter_by(user_id=user_id).all()
+    for r in recs:
+        if r.isin in ['BANK', 'DEBT']: continue  # Handled in assets usually, or skip
+
+        p = get_latest_price(r.isin)
+        val = r.units_owned * p
+
+        prof = session.query(FundProfile).filter_by(isin=r.isin).first()
+        cat = prof.category if prof else "Global"
+        bucket = get_bucket(cat)
+        current_counts[bucket] += val
+
+    # B. Cash/Assets (from Asset table)
+    for a in bs['assets']:
+        bucket = get_bucket(a['category'])  # e.g. "Real Estate" -> Growth or "Cash" -> Cash
+        if bucket in current_counts:
+            current_counts[bucket] += a['value']
+        else:
+            # Fallback for unmapped assets
+            current_counts["Cash"] += a['value']
+
+    # 3. Calculate %
+    exposure_pct = {k: round(v / total_val, 2) for k, v in current_counts.items()}
+    return exposure_pct, total_val
+
 # --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):
     # 1. Fetch History
@@ -944,6 +1023,39 @@ else:
         amount = c_a.number_input("New Cash (NOK)", step=5000.0)
         risk = c_b.select_slider("Risk", options=["Conservative", "Moderate", "Growth", "Aggressive"], value="Growth")
 
+
+        ###
+        # 1. Calculate & Display Rebalancing Gap
+        st.markdown("### ⚖️ Portfolio Rebalancing")
+
+        curr_exp, _ = get_portfolio_exposure(st.session_state.user_id)
+        target_model = RISK_MODELS.get(risk, RISK_MODELS["Growth"])
+
+        # Prepare Data for Chart
+        reb_data = []
+        for cat in ["Growth", "Defensive", "Cash"]:
+            c_val = curr_exp.get(cat, 0.0) * 100
+            t_val = target_model.get(cat, 0.0) * 100
+            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val})
+            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val})
+
+        df_reb = pd.DataFrame(reb_data)
+
+        # Render Grouped Bar Chart
+        fig_reb = px.bar(df_reb, x="Category", y="% Allocation", color="Type", barmode="group",
+                         color_discrete_map={"Current": "#EF553B", "Target": "#636EFA"},
+                         title=f"Rebalancing Check ({risk} Profile)")
+        st.plotly_chart(fig_reb, use_container_width=True)
+
+        # 2. Logic Check
+        # Optional: Show a warning if deviation is high
+        for cat, t_val in target_model.items():
+            c_val = curr_exp.get(cat, 0.0)
+            if c_val > (t_val + 0.10):
+                st.warning(
+                    f"⚠️ You are Overweight in {cat} ({c_val:.0%} vs {t_val:.0%}). AI will likely reduce exposure here.")
+        ###
+
         sim_date = None
         if mode == "Backtest":
             sim_date = st.date_input("Date", value=datetime.now() - timedelta(days=365))
@@ -958,7 +1070,9 @@ else:
                         st.warning("⚠️ Enter API Key.")
                     else:
                         agent = StrategyAgent(gemini_key, ai_model)
-                        user_prof = {'tax_residence': st.session_state.residences, 'risk': risk,
+                        user_prof = {'user_id': st.session_state.user_id,
+                                     'tax_residence': st.session_state.residences,
+                                     'risk': risk,
                                      'monthly_savings': session.query(User).get(
                                          st.session_state.user_id).monthly_savings_capacity}
                         bs = get_balance_sheet(st.session_state.user_id)

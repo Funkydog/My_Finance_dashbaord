@@ -1221,60 +1221,82 @@ else:
             st.plotly_chart(px.pie(pd.DataFrame(data_pie), values='Value', names='Category'))
 
         st.markdown("---")
-        # --- NEW: CONTROL BAR ---
+
+        # --- CONTROL BAR ---
         col_head, col_ctrl = st.columns([3, 1])
         col_head.subheader("Market Portfolio Performance")
 
-        # The Selector Widget
+        # Risk Timeframe Selector
         risk_timeframe = col_ctrl.selectbox(
             "Risk Lookback",
             options=["1wk", "1mo", "6mo", "1y"],
-            index=3,  # Default to 1y
+            index=3,
             format_func=lambda x: "Last " + x.replace("wk", "Week").replace("mo", "Month").replace("y", "Year")
         )
 
-        # Pass the selection to the function
-        df_p = get_portfolio_df(st.session_state.user_id, risk_period=risk_timeframe)
+        # Fetch Raw Data
+        df_raw = get_portfolio_df(st.session_state.user_id, risk_period=risk_timeframe)
 
-        if not df_p.empty:
-            # Dynamic Caption
-            st.caption(f"Risk Analysis based on **{risk_timeframe}** historical performance.")
+        if not df_raw.empty:
+            # ==========================================
+            # 1. CONSOLIDATED HOLDINGS TABLE
+            # ==========================================
+            st.markdown("#### 1. Current Holdings (Grouped)")
+
+            # Group by Fund Name and ISIN, Summing financial values
+            df_grouped = df_raw.groupby(['Allocation', 'ISIN']).agg({
+                'Invested': 'sum',
+                'Current Value': 'sum',
+                'Profit': 'sum',
+                'Volatility': 'first',  # Risk metrics are same for the fund
+                'Max Drawdown': 'first'
+            }).reset_index()
+
+            # Add "Return %" column for the group
+            df_grouped['Return %'] = (df_grouped['Profit'] / df_grouped['Invested'])
 
 
-            # Define styling logic
+            # Styling Logic (Red if Drawdown < -20%)
             def highlight_risk(row):
-                # If Max Drawdown is worse than -20% (e.g., -0.25), color red
                 if row['Max Drawdown'] < -0.20:
                     return ['background-color: #ffcccc; color: #990000'] * len(row)
                 return [''] * len(row)
 
 
-            # Apply style and formatting
-            styled_df = df_p.style.apply(highlight_risk, axis=1).format({
-                "Invested": "{:,.0f}",
-                "Current Value": "{:,.0f}",
-                "Profit": "{:+,.0f}",
-                "Volatility": "{:.1%}",  # Formats 0.15 as 15.0%
-                "Max Drawdown": "{:.1%}"  # Formats -0.20 as -20.0%
-            })
+            # Display Styled Table
+            st.dataframe(
+                df_grouped.style.apply(highlight_risk, axis=1).format({
+                    "Invested": "{:,.0f}",
+                    "Current Value": "{:,.0f}",
+                    "Profit": "{:+,.0f}",
+                    "Return %": "{:.1%}",
+                    "Volatility": "{:.1%}",
+                    "Max Drawdown": "{:.1%}"
+                }),
+                use_container_width=True,
+                column_order=["Allocation", "Invested", "Current Value", "Profit", "Return %", "Volatility",
+                              "Max Drawdown"]
+            )
 
-            # Render the styled dataframe
-            st.dataframe(styled_df, column_config={
-                "ID": None, "Delete?": None  # Hide utility columns in this view
-            }, use_container_width=True)
+            # ==========================================
+            # 2. TRANSACTION LOG (DETAILED)
+            # ==========================================
+            with st.expander("📜 View Transaction Log & Edit History"):
+                st.markdown("#### Detailed Trade History")
 
-            # --- VIEW 2: MANAGEMENT (Delete Rows) ---
-            with st.expander("🛠️ Manage Transactions (Delete)"):
+                # We use the raw dataframe here
                 edited_df = st.data_editor(
-                    df_p,
+                    df_raw,
                     column_config={
                         "Delete?": st.column_config.CheckboxColumn("Delete", default=False),
+                        "Date": st.column_config.DateColumn("Date", format="DD.MM.YYYY"),
                         "ID": None,  # Hide ID
-                        "Volatility": None,  # Hide Risk metrics in edit mode to save space
+                        "Volatility": None,  # Hide metrics in log view to reduce clutter
                         "Max Drawdown": None
                     },
                     disabled=["Allocation", "ISIN", "Date", "Invested", "Current Value", "Profit"],
-                    hide_index=True
+                    hide_index=True,
+                    use_container_width=True
                 )
 
                 to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
@@ -1285,9 +1307,10 @@ else:
                         st.rerun()
 
             # --- CHARTING ---
-            fund_isins = sorted([x for x in df_p['ISIN'].unique() if x not in ['BANK', 'DEBT']])
+            fund_isins = sorted([x for x in df_raw['ISIN'].unique() if x not in ['BANK', 'DEBT']])
             if fund_isins:
-                sel = st.selectbox("Chart Fund", fund_isins, format_func=get_safe_fund_name,
+                st.markdown("### Fund Performance Chart")
+                sel = st.selectbox("Select Fund", fund_isins, format_func=get_safe_fund_name,
                                    key="portfolio_chart_select")
                 fig = plot_history(session, st.session_state.user_id, sel, "kr", 1.0)
                 if fig: st.plotly_chart(fig)

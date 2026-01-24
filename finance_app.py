@@ -1349,29 +1349,30 @@ else:
 
                 chart_type = c_bench_2.radio(
                     "View Type",
-                    ["Bar (Snapshot)", "Line (History)"],
+                    ["Bar (Snapshot)", "Line (History)", "🔮 Projection (5Y)"],
                     horizontal=True,
                     label_visibility="collapsed"
                 )
 
-                # 2. Logic Switch
+                # --- CALCULATE CURRENT STATE (Required for all views) ---
+                total_invested = df_raw['Invested'].sum()
+                current_portfolio_value = df_raw['Current Value'].sum()
+                hypothetical_cash_value = 0.0
+                today = datetime.now().date()
+
+                # Calculate Hypothetical Cash Value (Opportunity Cost)
+                for index, row in df_raw.iterrows():
+                    days_held = (today - row['Date']).days
+                    years_held = days_held / 365.25
+                    rate_decimal = savings_rate_input / 100.0
+                    hypothetical_cash_value += row['Invested'] * ((1 + rate_decimal) ** years_held)
+
+                # --- VIEW LOGIC ---
                 if chart_type == "Bar (Snapshot)":
-                    # --- EXISTING CALCULATION LOGIC ---
-                    total_invested = df_raw['Invested'].sum()
-                    current_portfolio_value = df_raw['Current Value'].sum()
-                    hypothetical_cash_value = 0.0
-                    today = datetime.now().date()
-
-                    for index, row in df_raw.iterrows():
-                        days_held = (today - row['Date']).days
-                        years_held = days_held / 365.25
-                        rate_decimal = savings_rate_input / 100.0
-                        hypothetical_cash_value += row['Invested'] * ((1 + rate_decimal) ** years_held)
-
+                    # [Keep your existing Bar Chart Logic here]
                     alpha = current_portfolio_value - hypothetical_cash_value
                     is_beating = alpha >= 0
 
-                    # Display Metrics
                     c_bench_3.metric(
                         label=f"Value vs. {savings_rate_input}% Savings",
                         value=f"{current_portfolio_value:,.0f} NOK",
@@ -1379,94 +1380,120 @@ else:
                         delta_color="normal"
                     )
 
-                    # --- PREPARE DATA WITH DESCRIPTIONS ---
                     bench_data = [
-                        {
-                            "Scenario": "1. Principal",
-                            "Value": total_invested,
-                            "Color": "LightGray",
-                            "Desc": "<b>Total Cash Invested</b><br>The sum of all transfers you made into the market."
-                        },
-                        {
-                            "Scenario": f"2. Savings ({savings_rate_input}%)",
-                            "Value": hypothetical_cash_value,
-                            "Color": "#636EFA",
-                            "Desc": f"<b>Hypothetical Benchmark</b><br>What your money would be worth today if you had<br>left it in a bank account at {savings_rate_input}% interest."
-                        },
-                        {
-                            "Scenario": "3. Your Portfolio",
-                            "Value": current_portfolio_value,
-                            "Color": "#00CC96" if is_beating else "#EF553B",
-                            "Desc": "<b>Actual Market Value</b><br>The current value of your holdings based on latest prices."
-                        }
+                        {"Scenario": "1. Principal", "Value": total_invested, "Color": "LightGray",
+                         "Desc": "Total Cash Invested"},
+                        {"Scenario": f"2. Savings ({savings_rate_input}%)", "Value": hypothetical_cash_value,
+                         "Color": "#636EFA", "Desc": "Hypothetical Benchmark"},
+                        {"Scenario": "3. Your Portfolio", "Value": current_portfolio_value,
+                         "Color": "#00CC96" if is_beating else "#EF553B", "Desc": "Actual Market Value"}
                     ]
-
-                    df_bench = pd.DataFrame(bench_data)
-
-                    # --- PLOT WITH CUSTOM HOVER ---
-                    fig_bench = px.bar(
-                        df_bench,
-                        x="Value",
-                        y="Scenario",
-                        orientation='h',
-                        text="Value",
-                        color="Scenario",
-                        color_discrete_map={d["Scenario"]: d["Color"] for d in bench_data},
-                        # 1. Pass the description to the chart data
-                        custom_data=["Desc"]
-                    )
-
-                    # 2. Update the tooltip format
-                    fig_bench.update_traces(
-                        texttemplate='%{text:,.0f}',
-                        textposition='auto',
-                        hovertemplate="<b>%{y}</b><br>Value: %{x:,.0f} NOK<br><br>%{customdata[0]}<extra></extra>"
-                    )
-
+                    fig_bench = px.bar(pd.DataFrame(bench_data), x="Value", y="Scenario", orientation='h',
+                                       text="Value", color="Scenario",
+                                       color_discrete_map={d["Scenario"]: d["Color"] for d in bench_data},
+                                       custom_data=["Desc"])
+                    fig_bench.update_traces(texttemplate='%{text:,.0f}', textposition='auto',
+                                            hovertemplate="<b>%{y}</b><br>%{x:,.0f} NOK<br>%{customdata[0]}<extra></extra>")
                     fig_bench.update_layout(showlegend=False, height=250, margin=dict(l=0, r=0, t=10, b=0))
                     st.plotly_chart(fig_bench, use_container_width=True)
 
-                else:
-                    # --- NEW LINE CHART LOGIC ---
-                    with st.spinner("Reconstructing portfolio history..."):
+                elif chart_type == "Line (History)":
+                    # [Keep your existing Line Chart Logic here]
+                    # (Ensure you use the 'get_portfolio_evolution' function we fixed earlier)
+                    with st.spinner("Reconstructing history..."):
                         df_history = get_portfolio_evolution(st.session_state.user_id, savings_rate_input)
-
                     if not df_history.empty:
-                        # 1. Metrics
                         latest = df_history.iloc[-1]
                         raw_profit = latest['Portfolio'] - latest['Invested']
                         alpha = latest['Portfolio'] - latest['Savings']
-
                         c1, c2 = st.columns(2)
-                        c1.metric("Total Profit (Raw)", f"{latest['Portfolio']:,.0f} NOK", f"{raw_profit:+,.0f} NOK")
-                        c2.metric("vs. Savings (Alpha)", f"{alpha:+,.0f} NOK", "Real Excess Return",
-                                  delta_color="normal")
+                        c1.metric("Total Profit", f"{latest['Portfolio']:,.0f} NOK", f"{raw_profit:+,.0f} NOK")
+                        c2.metric("vs. Savings", f"{alpha:+,.0f} NOK", "Excess Return", delta_color="normal")
 
-                        # 2. The Chart
-                        fig_line = px.line(df_history, y=["Invested", "Savings", "Portfolio"],
-                                           title="Performance Evolution",
-                                           color_discrete_map={
-                                               "Invested": "gray",
-                                               "Savings": "#636EFA",
-                                               "Portfolio": "#00CC96" if alpha > 0 else "#EF553B"
-                                           })
-
-                        # Style: Dashed line for Invested to show it's the baseline
+                        fig_line = px.line(df_history, y=["Invested", "Savings", "Portfolio"], title="Past Performance",
+                                           color_discrete_map={"Invested": "gray", "Savings": "#636EFA",
+                                                               "Portfolio": "#00CC96" if alpha > 0 else "#EF553B"})
                         fig_line.update_traces(patch={"line": {"dash": "dash"}}, selector={"name": "Invested"})
                         fig_line.update_layout(hovermode="x unified", legend_title="", height=350)
-
                         st.plotly_chart(fig_line, use_container_width=True)
 
-                        # 3. 🆕 DESCRIPTION / LEGEND
-                        st.info("""
-                                            **📝 Chart Guide:**
-                                            - **Invested (Gray):** The actual hard cash you transferred into the market (Principal).
-                                            - **Savings (Blue):** A **hypothetical scenario** showing what your wealth *would* be if you had simply deposited that cash into a bank account at the selected interest rate instead of investing.
-                                            - **Portfolio (Green/Red):** The actual current market value of your funds. 
-                                            """)
+                else:
+                    # ==========================================
+                    # 🔮 NEW: FUTURE PROJECTION LOGIC
+                    # ==========================================
 
+                    # 1. Extra Input: Targeted Return
+                    target_return = c_bench_3.number_input(
+                        "Target Portfolio Return (%)",
+                        min_value=0.0, max_value=30.0, value=8.0, step=0.5,
+                        help="Assumed average annual return for your investment portfolio."
+                    )
+
+                    # 2. Generate Projection Data
+                    years = 5
+                    future_dates = pd.date_range(start=today, periods=years * 12, freq='ME')  # Monthly endpoints
+
+                    proj_data = []
+
+                    # Starting Values (From Today)
+                    val_savings = hypothetical_cash_value
+                    val_portfolio = current_portfolio_value
+
+                    # Monthly Rates
+                    r_save_mo = (savings_rate_input / 100) / 12
+                    r_port_mo = (target_return / 100) / 12
+
+                    for date in future_dates:
+                        # Compound Growth
+                        val_savings = val_savings * (1 + r_save_mo)
+                        val_portfolio = val_portfolio * (1 + r_port_mo)
+
+                        proj_data.append({
+                            "Date": date,
+                            "Scenario": f"Savings ({savings_rate_input}%)",
+                            "Value": val_savings
+                        })
+                        proj_data.append({
+                            "Date": date,
+                            "Scenario": f"Portfolio ({target_return}%)",
+                            "Value": val_portfolio
+                        })
+
+                    df_proj = pd.DataFrame(proj_data)
+
+                    # 3. Calculate 5-Year Outcome
+                    final_savings = df_proj[df_proj["Scenario"].str.contains("Savings")].iloc[-1]["Value"]
+                    final_port = df_proj[df_proj["Scenario"].str.contains("Portfolio")].iloc[-1]["Value"]
+                    diff = final_port - final_savings
+
+                    # 4. Visualization
+                    st.caption(f"Projecting values 5 years into the future based on assumed rates.")
+
+                    fig_proj = px.line(
+                        df_proj,
+                        x="Date",
+                        y="Value",
+                        color="Scenario",
+                        title="5-Year Wealth Projection",
+                        color_discrete_map={
+                            f"Savings ({savings_rate_input}%)": "#636EFA",
+                            f"Portfolio ({target_return}%)": "#00CC96" if diff > 0 else "#EF553B"
+                        }
+                    )
+
+                    # Add Area Fill to highlight the "Gap"
+                    fig_proj.update_traces(fill='tonexty')
+                    fig_proj.update_layout(hovermode="x unified", legend_title="", height=350)
+
+                    st.plotly_chart(fig_proj, use_container_width=True)
+
+                    # 5. Summary Text
+                    if diff > 0:
+                        st.success(
+                            f"🎉 **Potential Gain:** By sticking to your strategy, you could generate an extra **{diff:,.0f} NOK** over 5 years compared to the bank.")
                     else:
-                        st.warning("Not enough history to generate line chart.")
+                        st.error(
+                            f"⚠️ **Warning:** At {target_return}%, your portfolio is projected to underperform the savings account by **{abs(diff):,.0f} NOK**.")
 
                 st.divider()
 

@@ -571,7 +571,7 @@ def get_balance_sheet(user_id):
     }
 
 
-def get_portfolio_df(user_id):
+def get_portfolio_df(user_id, risk_period="1y"):
     recs = session.query(FinancialRecord).filter_by(user_id=user_id).order_by(desc(FinancialRecord.date)).all()
     data = []
 
@@ -588,7 +588,8 @@ def get_portfolio_df(user_id):
             if prof: name = prof.name
 
             # --- CALL RISK CALCULATOR ---
-            vol, dd = calculate_risk_metrics(r.isin)
+            # Pass the selected period to the calculator
+            vol, dd = calculate_risk_metrics(r.isin, period=risk_period)
 
         curr_val = r.units_owned * p
         profit = curr_val - r.amount
@@ -679,16 +680,24 @@ def get_macro_indicators():
         return f"Error fetching macro data: {str(e)}"
 
 
-
-def calculate_risk_metrics(isin):
+def calculate_risk_metrics(isin, period="1y"):
     """
-    Calculates 1-Year Max Drawdown and Annualized Volatility.
-    Returns: (volatility_pct, max_drawdown_pct)
+    Calculates Max Drawdown and Annualized Volatility over a dynamic period.
+    Options: '1y', '6mo', '1mo', '1wk'
     """
-    # 1. Fetch last 1 year of data (approx 260 trading days)
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=365)
 
+    # Determine lookback window
+    if period == "1wk":
+        start_date = end_date - timedelta(days=7)
+    elif period == "1mo":
+        start_date = end_date - timedelta(days=30)
+    elif period == "6mo":
+        start_date = end_date - timedelta(days=180)
+    else:  # Default 1y
+        start_date = end_date - timedelta(days=365)
+
+    # Fetch Data
     hist = session.query(FundPriceHistory.close_price).filter(
         FundPriceHistory.isin == isin,
         FundPriceHistory.date >= start_date
@@ -696,24 +705,22 @@ def calculate_risk_metrics(isin):
 
     prices = [h[0] for h in hist]
 
-    if len(prices) < 30:  # Not enough data
+    # Data Integrity Check
+    min_points = 2  # Need at least 2 points to calc return
+    if len(prices) < min_points:
         return 0.0, 0.0
 
-    # 2. Prepare Data
     price_series = pd.Series(prices)
 
-    # 3. Calculate Volatility (Standard Deviation of Daily Returns * sqrt(252))
+    # 1. Volatility (Annualized)
+    # We always annualize volatility (sqrt(252)) to make it comparable across timeframes
     returns = price_series.pct_change().dropna()
     if returns.empty: return 0.0, 0.0
+    volatility = returns.std() * np.sqrt(252) * 100
 
-    volatility = returns.std() * np.sqrt(252) * 100  # Annualized %
-
-    # 4. Calculate Max Drawdown
-    # Calculate rolling maximum (Peak)
+    # 2. Max Drawdown (Specific to the selected period)
     rolling_max = price_series.cummax()
-    # Calculate drawdown relative to peak
     drawdown = (price_series - rolling_max) / rolling_max
-    # The minimum value is the Maximum Drawdown
     max_dd = drawdown.min() * 100
 
     return round(volatility, 1), round(max_dd, 1)
@@ -1023,39 +1030,6 @@ else:
         amount = c_a.number_input("New Cash (NOK)", step=5000.0)
         risk = c_b.select_slider("Risk", options=["Conservative", "Moderate", "Growth", "Aggressive"], value="Growth")
 
-
-        ###
-        # 1. Calculate & Display Rebalancing Gap
-        st.markdown("### ⚖️ Portfolio Rebalancing")
-
-        curr_exp, _ = get_portfolio_exposure(st.session_state.user_id)
-        target_model = RISK_MODELS.get(risk, RISK_MODELS["Growth"])
-
-        # Prepare Data for Chart
-        reb_data = []
-        for cat in ["Growth", "Defensive", "Cash"]:
-            c_val = curr_exp.get(cat, 0.0) * 100
-            t_val = target_model.get(cat, 0.0) * 100
-            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val})
-            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val})
-
-        df_reb = pd.DataFrame(reb_data)
-
-        # Render Grouped Bar Chart
-        fig_reb = px.bar(df_reb, x="Category", y="% Allocation", color="Type", barmode="group",
-                         color_discrete_map={"Current": "#EF553B", "Target": "#636EFA"},
-                         title=f"Rebalancing Check ({risk} Profile)")
-        st.plotly_chart(fig_reb, use_container_width=True)
-
-        # 2. Logic Check
-        # Optional: Show a warning if deviation is high
-        for cat, t_val in target_model.items():
-            c_val = curr_exp.get(cat, 0.0)
-            if c_val > (t_val + 0.10):
-                st.warning(
-                    f"⚠️ You are Overweight in {cat} ({c_val:.0%} vs {t_val:.0%}). AI will likely reduce exposure here.")
-        ###
-
         sim_date = None
         if mode == "Backtest":
             sim_date = st.date_input("Date", value=datetime.now() - timedelta(days=365))
@@ -1157,6 +1131,76 @@ else:
                         st.query_params["tab"] = "📊 Portfolio"  # Sync URL
                         st.rerun()
 
+
+        ###
+        # 1. Calculate & Display Rebalancing Gap
+        st.markdown("### ⚖️ Portfolio Rebalancing")
+
+        # --- DEFINITIONS FOR TOOLTIPS ---
+        BUCKET_DESCRIPTIONS = {
+            "Growth": "<b>High Risk / High Reward</b><br>Focus: Capital Appreciation.<br>Includes: Tech (QQQ), Global Indexes (SPY, MSCI World), Emerging Markets.",
+            "Defensive": "<b>Moderate Risk / Stability</b><br>Focus: Dividends & Low Volatility.<br>Includes: Healthcare, Energy (Equinor), Staples (Mowi/Seafood), Gold.",
+            "Cash": "<b>Zero Risk / Liquidity</b><br>Focus: Capital Preservation.<br>Includes: Bank Accounts, Money Market Funds, Short-term Bonds."
+        }
+
+        curr_exp, _ = get_portfolio_exposure(st.session_state.user_id)
+        target_model = RISK_MODELS.get(risk, RISK_MODELS["Growth"])
+
+        # Prepare Data for Chart
+        reb_data = []
+        for cat in ["Growth", "Defensive", "Cash"]:
+            c_val = curr_exp.get(cat, 0.0) * 100
+            t_val = target_model.get(cat, 0.0) * 100
+
+            # We add the 'Description' field here so Plotly can see it
+            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val, "Description": desc})
+            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val, "Description": desc})
+
+
+        # Prepare Data for Chart
+        reb_data = []
+        for cat in ["Growth", "Defensive", "Cash"]:
+            c_val = curr_exp.get(cat, 0.0) * 100
+            t_val = target_model.get(cat, 0.0) * 100
+            desc = BUCKET_DESCRIPTIONS.get(cat, "")
+
+            # We add the 'Description' field here so Plotly can see it
+            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val, "Description": desc})
+            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val, "Description": desc})
+
+        df_reb = pd.DataFrame(reb_data)
+
+        # Render Grouped Bar Chart with Custom Hover
+        fig_reb = px.bar(
+            df_reb,
+            x="Category",
+            y="% Allocation",
+            color="Type",
+            barmode="group",
+            color_discrete_map={"Current": "#EF553B", "Target": "#636EFA"},
+            title=f"Rebalancing Check ({risk} Profile)",
+            # 1. Pass the description column to custom_data
+            custom_data=["Description"]
+        )
+
+        # 2. Configure the Hover Template to show the description
+        fig_reb.update_traces(
+            hovertemplate="<b>%{x}</b><br>Allocation: %{y:.1f}%<br><br>%{customdata[0]}<extra></extra>"
+        )
+
+        st.plotly_chart(fig_reb, use_container_width=True)
+
+        # 2. Logic Check
+        # Optional: Show a warning if deviation is high
+        for cat, t_val in target_model.items():
+            c_val = curr_exp.get(cat, 0.0)
+            if c_val > (t_val + 0.10):
+                st.warning(
+                    f"⚠️ You are Overweight in {cat} ({c_val:.0%} vs {t_val:.0%}). AI will likely reduce exposure here.")
+        ###
+
+
+
     elif selected_tab == "📊 Portfolio":
         bs = get_balance_sheet(st.session_state.user_id)
         total_assets = sum(a['value'] for a in bs['assets']) + bs['market_portfolio_total']
@@ -1177,12 +1221,24 @@ else:
             st.plotly_chart(px.pie(pd.DataFrame(data_pie), values='Value', names='Category'))
 
         st.markdown("---")
-        st.subheader("Market Portfolio Performance")
-        df_p = get_portfolio_df(st.session_state.user_id)
+        # --- NEW: CONTROL BAR ---
+        col_head, col_ctrl = st.columns([3, 1])
+        col_head.subheader("Market Portfolio Performance")
+
+        # The Selector Widget
+        risk_timeframe = col_ctrl.selectbox(
+            "Risk Lookback",
+            options=["1wk", "1mo", "6mo", "1y"],
+            index=3,  # Default to 1y
+            format_func=lambda x: "Last " + x.replace("wk", "Week").replace("mo", "Month").replace("y", "Year")
+        )
+
+        # Pass the selection to the function
+        df_p = get_portfolio_df(st.session_state.user_id, risk_period=risk_timeframe)
 
         if not df_p.empty:
-            # --- VIEW 1: RISK & PERFORMANCE DASHBOARD (Styled) ---
-            st.caption("Risk Analysis (Red highlight = Drawdown > 20%)")
+            # Dynamic Caption
+            st.caption(f"Risk Analysis based on **{risk_timeframe}** historical performance.")
 
 
             # Define styling logic

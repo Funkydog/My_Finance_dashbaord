@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np # Ensure numpy is imported
 import plotly.express as px
 import plotly.graph_objects as go
 import yfinance as yf
@@ -11,7 +12,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from datetime import datetime, timedelta
 
 # ==========================================
-# 🧠 AI AGENT CONFIGURATION
+# 🧠 AI AGENT CONFIGURATION (UPDATED)
 # ==========================================
 SYSTEM_PROMPT_TEMPLATE = """
 You are a CFA-certified Private Wealth Manager.
@@ -23,21 +24,28 @@ You are a CFA-certified Private Wealth Manager.
 **Balance Sheet Context:**
 {balance_sheet_json}
 
+**Current Portfolio Exposure (REBALANCING LOGIC):**
+{portfolio_exposure}
+**Rebalancing Rule:**
+Compare the 'Current Exposure' above to the client's Risk Profile ({risk_profile}).
+- If they are **Overweight** in a category (e.g., >70% in Growth), DO NOT allocate new cash there.
+- Prioritize **Underweighted** categories to bring them closer to target.
+- Explicitly state: "Allocating to [Category] to rebalance your underweight exposure.
+
 **Investment Goal:**
 Allocate **{amount} {currency}** (New Cash) into the available universe.
 **Timing Context:** Analysis Date: {analysis_date}.
 
 **3. MACRO-REGIME FRAMEWORK (The Logic):**
-- **Step A (Identify Regime):** Analyze the current geopolitical situation (wars, supply chains) and economic data (inflation, rates). Classify the current regime:
-    * *Inflationary Growth* (Overweight Commodities/Value)
-    * *Stagflation* (Overweight Cash/Defensives/Gold)
-    * *Disinflationary Growth* (Overweight Tech/Growth)
-    * *Deflationary Bust* (Overweight Bonds/Quality)
-- **Step B (Factor Comparison):** Compare the top funds in the universe "Head-to-Head" based on factors: **Momentum, Value, Quality, Low Volatility**.
-- **Step C (Scenario Analysis):** Your de-risking strategy must account for:
-    * *Scenario 1 (Base Case):* Status Quo.
-    * *Scenario 2 (Bear Case):* Geopolitical escalation or Policy Error.
-    * *Scenario 3 (Bull Case):* Resolution/Soft Landing.
+You have access to REAL-TIME Macro Indicators. Use them to determine the regime.
+**Live Macro Data:**
+{macro_data}
+
+**Regime Classification Rules:**
+- **Inflationary Growth:** 10Y Yields Rising, Oil Rising, SP500 > SMA200. (Action: Overweight Value/Commodities).
+- **Stagflation:** 10Y Yields Rising, GDP/Growth Slowing (or VIX High), Gold Rising. (Action: Overweight Cash/Defensives/Gold).
+- **Disinflationary Growth (Goldilocks):** 10Y Yields Falling/Stable, VIX Low, SP500 > SMA200. (Action: Overweight Tech/Growth).
+- **Deflationary Bust:** 10Y Yields Falling (Flight to Safety), VIX Spiking, SP500 < SMA200. (Action: Overweight Bonds/Quality).
 
 **Strategic Rules:**
 1. **Liquidity Check:** If 'Cash' assets are < 3 months of expenses (approx 60k), prioritize filling the 'Savings' bucket.
@@ -49,7 +57,6 @@ Allocate **{amount} {currency}** (New Cash) into the available universe.
 You have access to the **50-Day Simple Moving Average (SMA)** for each fund. Use **Mean Reversion Theory**:
 - **✅ Good Entry (Buy):** Price is **BELOW** the SMA. The asset is "on sale" relative to its recent trend.
 - **⚠️ Caution (Wait/Drip):** Price is **ABOVE** the SMA (especially > 5% above). The asset is "extended" or "expensive".
-- **Strategy:** If a good fundamental fund is trading **below its SMA**, overweight it in this allocation to capture the rebound.
 
 **Available Funds (Universe):**
 {fund_list_json}
@@ -57,9 +64,9 @@ You have access to the **50-Day Simple Moving Average (SMA)** for each fund. Use
 **Output Format:**
 Respond with a strict JSON object:
 {{
-  "current_regime": "Name of the regime (e.g., Late-Cycle Stagflation)",
+  "current_regime": "Name of the regime (e.g., Disinflationary Growth)",
   "allocations": {{ "ISIN_OR_TICKER": AMOUNT }},
-  "reasoning": "A structured analysis: 1) Why this Regime? 2) Head-to-Head Fund Comparison (e.g., 'Fund A beats Fund B because it has higher Quality factor exposure suitable for this volatility'). 3) Scenario De-risking plan. Then Explain the logic. Mention SPECIFIC technical signals (e.g., 'Allocated more to Fund X because it is trading 3% below its SMA, offering a good technical entry point')."
+  "reasoning": "A structured analysis: 1) Cite specific macro data (e.g. 'With 10Y Yields at X% and Oil falling...'). 2) Explain the Regime choice. 3) Fund Selection: Why these specific funds given the regime and their SMA status."
 }}
 """
 
@@ -174,6 +181,29 @@ SUGGESTED_FUNDS = [
     {"ticker": "NOVO-B.CO", "cat": "Health", "name": "Novo Nordisk", "countries": ["Denmark", "Global"]},
 ]
 
+# ==========================================
+# 2b. REBALANCING CONFIGURATION
+# ==========================================
+# 1. Target Weights per Risk Profile
+RISK_MODELS = {
+    "Conservative": {"Defensive": 0.50, "Growth": 0.20, "Cash": 0.30},
+    "Moderate":     {"Defensive": 0.35, "Growth": 0.45, "Cash": 0.20},
+    "Growth":       {"Defensive": 0.15, "Growth": 0.75, "Cash": 0.10},
+    "Aggressive":   {"Defensive": 0.05, "Growth": 0.90, "Cash": 0.05}
+}
+
+# 2. Map Fund Categories to Macro Buckets
+# (Adjust these keys based on the categories you use in your app)
+CATEGORY_MAP = {
+    "Tech": "Growth", "Global": "Growth", "Seafood": "Growth", "USA": "Growth",
+    "Health": "Defensive", "Energy": "Defensive", "Norwegian": "Defensive",
+    "Bonds": "Defensive", "Bank": "Cash", "Cash": "Cash"
+}
+
+def get_bucket(cat_name):
+    """Maps a specific fund category (e.g., 'Tech') to a Macro Bucket (e.g., 'Growth')."""
+    return CATEGORY_MAP.get(cat_name, "Growth") # Default to Growth if unknown
+
 
 # ==========================================
 # 3. STRATEGY AGENT
@@ -186,10 +216,24 @@ class StrategyAgent:
     def get_allocation(self, user_profile, funds, amount, balance_sheet, analysis_date=None):
         target_date = analysis_date if analysis_date else datetime.now()
 
+        # --- NEW: FETCH MACRO DATA ---
+        macro_text = "Data not available (Simulation Mode - Manual Regime Assumption Required)"
+        # Only fetch live macro data if we are NOT in a deep historical backtest
+        if (datetime.now() - target_date).days < 3:
+            macro_text = get_macro_indicators()
+
+        # --- NEW: CALCULATE EXPOSURE ---
+        # We need the user ID to fetch the portfolio.
+        # Assuming you pass 'user_id' in user_profile or we fetch it from session outside.
+        # For this function, let's assume user_profile has 'user_id'
+        cur_exp, tot_val = get_portfolio_exposure(user_profile.get('user_id'))
+
+        # Format for AI
+        exp_str = json.dumps(cur_exp, indent=2)
+
         funds_context = []
         for f in funds:
             # 1. Fetch Price AT THE TARGET DATE
-            # We look for the closest price <= target_date
             price_rec = session.query(FundPriceHistory).filter(
                 FundPriceHistory.isin == f.isin,
                 FundPriceHistory.date <= target_date
@@ -197,8 +241,7 @@ class StrategyAgent:
 
             curr_p = price_rec.close_price if price_rec else 0.0
 
-            # 2. Calculate SMA-50 using historical window
-            # Get 50 records BEFORE or ON the target date
+            # 2. Calculate SMA-50
             sma_hist = session.query(FundPriceHistory.close_price).filter(
                 FundPriceHistory.isin == f.isin,
                 FundPriceHistory.date <= target_date
@@ -223,6 +266,7 @@ class StrategyAgent:
             total_debt = sum(d['principal'] for d in debts)
             if total_debt > 0: avg_rate = sum(d['principal'] * d['interest_rate'] for d in debts) / total_debt
 
+        # --- UPDATED PROMPT INJECTION ---
         prompt = SYSTEM_PROMPT_TEMPLATE.format(
             tax_residence=user_profile['tax_residence'],
             amount=amount,
@@ -230,9 +274,11 @@ class StrategyAgent:
             risk_profile=user_profile.get('risk', 'Growth'),
             monthly_savings=user_profile.get('monthly_savings', 0),
             balance_sheet_json=bs_json,
+            portfolio_exposure=exp_str,  # <--- INJECT EXPOSURE HERE
             avg_debt_rate=round(avg_rate, 2),
             fund_list_json=json.dumps(funds_context, indent=2),
-            analysis_date=target_date.strftime('%Y-%m-%d')
+            analysis_date=target_date.strftime('%Y-%m-%d'),
+            macro_data=macro_text
         )
         return self._call_gemini_json(prompt)
 
@@ -435,12 +481,7 @@ def update_price_history(isin):
     except:
         pass
 
-
-#Done: make sure that the prices get updated only if there are not already in the database, update only the missing ones
-#TODO: Close the gap between imported price and time and date and new investment time and date
-#Done: When backtest is selected, there is an error - the button submit seems not the be working - check cause
-#Done: Show the moving average on the graph
-#Done: Make a logic when price is above moving average give a message alert to the user, and if the moving average is above the envolope recommend not to invest in this fund until the prices are down into the envolope zone
+#TODO: make a warning message if the fund is not updated as of today (due to lack of data from yahoo)
 
 # --- NEW: AUTO-UPDATE ON LOGIN ---
 def refresh_user_prices(user_id):
@@ -524,23 +565,42 @@ def get_balance_sheet(user_id):
     }
 
 
-def get_portfolio_df(user_id):
+def get_portfolio_df(user_id, risk_period="1y"):
     recs = session.query(FinancialRecord).filter_by(user_id=user_id).order_by(desc(FinancialRecord.date)).all()
     data = []
+
     for r in recs:
         p = 1.0
         name = r.allocation_type
+        vol = 0.0
+        dd = 0.0
+
+        # Only calculate risk for actual Funds (skip Bank/Debt)
         if r.isin not in ['BANK', 'DEBT']:
             p = get_latest_price(r.isin)
             prof = session.query(FundProfile).filter_by(isin=r.isin).first()
             if prof: name = prof.name
+
+            # --- CALL RISK CALCULATOR ---
+            # Pass the selected period to the calculator
+            vol, dd = calculate_risk_metrics(r.isin, period=risk_period)
+
+        curr_val = r.units_owned * p
+        profit = curr_val - r.amount
+
         data.append({
             "ID": r.id,
             "Delete?": False,
-            "Allocation": name, "ISIN": r.isin, "Date": r.date.date(),
-            "Invested": r.amount, "Current Value": r.units_owned * p,
-            "Profit": (r.units_owned * p) - r.amount, "Entry Price": r.entry_price
+            "Allocation": name,
+            "ISIN": r.isin,
+            "Date": r.date.date(),
+            "Invested": r.amount,
+            "Current Value": curr_val,
+            "Profit": profit,
+            "Volatility": vol / 100,  # Store as float for formatting (e.g. 0.15 for 15%)
+            "Max Drawdown": dd / 100  # Store as float (e.g. -0.20 for -20%)
         })
+
     return pd.DataFrame(data)
 
 
@@ -557,6 +617,240 @@ def get_safe_fund_name(isin_code):
     p = session.query(FundProfile).filter_by(isin=isin_code).first()
     return p.name if p else f"{isin_code} (Unknown)"
 
+
+# --- NEW: MACRO DATA FETCHER ---
+def get_macro_indicators():
+    """Fetches key economic indicators for AI context."""
+    tickers = {
+        "US 10Y Yield": "^TNX",
+        "Crude Oil": "CL=F",
+        "Gold": "GC=F",
+        "VIX (Volatility)": "^VIX",
+        "S&P 500": "^GSPC"
+    }
+
+    data_summary = []
+
+    try:
+        # Fetch current data for all tickers
+        for name, ticker in tickers.items():
+            t = yf.Ticker(ticker)
+
+            # fast_info is often faster/more reliable for "last price" than history
+            try:
+                price = t.fast_info['last_price']
+            except:
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    price = hist['Close'].iloc[-1]
+                else:
+                    price = 0.0
+
+            # Specific logic for SP500 trend (200 Day SMA)
+            trend_txt = ""
+            if name == "S&P 500":
+                try:
+                    hist_long = t.history(period="1y")
+                    if len(hist_long) > 200:
+                        sma200 = hist_long['Close'].rolling(window=200).mean().iloc[-1]
+                        if price > sma200:
+                            trend_txt = f"(Bullish: Above 200SMA {sma200:.0f})"
+                        else:
+                            trend_txt = f"(Bearish: Below 200SMA {sma200:.0f})"
+                except:
+                    pass
+
+            # Formatting
+            if name == "US 10Y Yield":
+                val_str = f"{price:.2f}%"
+            else:
+                val_str = f"{price:,.2f}"
+
+            data_summary.append(f"- {name}: {val_str} {trend_txt}")
+
+        return "\n".join(data_summary)
+
+    except Exception as e:
+        return f"Error fetching macro data: {str(e)}"
+
+
+def calculate_risk_metrics(isin, period="1y"):
+    """
+    Calculates Max Drawdown and Annualized Volatility over a dynamic period.
+    Options: '1y', '6mo', '1mo', '1wk'
+    """
+    end_date = datetime.now()
+
+    # Determine lookback window
+    if period == "1wk":
+        start_date = end_date - timedelta(days=7)
+    elif period == "1mo":
+        start_date = end_date - timedelta(days=30)
+    elif period == "6mo":
+        start_date = end_date - timedelta(days=180)
+    else:  # Default 1y
+        start_date = end_date - timedelta(days=365)
+
+    # Fetch Data
+    hist = session.query(FundPriceHistory.close_price).filter(
+        FundPriceHistory.isin == isin,
+        FundPriceHistory.date >= start_date
+    ).order_by(FundPriceHistory.date).all()
+
+    prices = [h[0] for h in hist]
+
+    # Data Integrity Check
+    min_points = 2  # Need at least 2 points to calc return
+    if len(prices) < min_points:
+        return 0.0, 0.0
+
+    price_series = pd.Series(prices)
+
+    # 1. Volatility (Annualized)
+    # We always annualize volatility (sqrt(252)) to make it comparable across timeframes
+    returns = price_series.pct_change().dropna()
+    if returns.empty: return 0.0, 0.0
+    volatility = returns.std() * np.sqrt(252) * 100
+
+    # 2. Max Drawdown (Specific to the selected period)
+    rolling_max = price_series.cummax()
+    drawdown = (price_series - rolling_max) / rolling_max
+    max_dd = drawdown.min() * 100
+
+    return round(volatility, 1), round(max_dd, 1)
+
+
+def get_portfolio_exposure(user_id):
+    """Calculates the current % allocation of the user's total net worth."""
+    # 1. Get Balance Sheet
+    bs = get_balance_sheet(user_id)
+    total_val = bs['market_portfolio_total'] + sum(a['value'] for a in bs['assets'])
+
+    if total_val == 0: return {}, 0
+
+    # 2. Group Market Holdings
+    current_counts = {"Growth": 0.0, "Defensive": 0.0, "Cash": 0.0}
+
+    # A. Funds in Portfolio
+    recs = session.query(FinancialRecord).filter_by(user_id=user_id).all()
+    for r in recs:
+        if r.isin in ['BANK', 'DEBT']: continue  # Handled in assets usually, or skip
+
+        p = get_latest_price(r.isin)
+        val = r.units_owned * p
+
+        prof = session.query(FundProfile).filter_by(isin=r.isin).first()
+        cat = prof.category if prof else "Global"
+        bucket = get_bucket(cat)
+        current_counts[bucket] += val
+
+    # B. Cash/Assets (from Asset table)
+    for a in bs['assets']:
+        bucket = get_bucket(a['category'])  # e.g. "Real Estate" -> Growth or "Cash" -> Cash
+        if bucket in current_counts:
+            current_counts[bucket] += a['value']
+        else:
+            # Fallback for unmapped assets
+            current_counts["Cash"] += a['value']
+
+    # 3. Calculate %
+    exposure_pct = {k: round(v / total_val, 2) for k, v in current_counts.items()}
+    return exposure_pct, total_val
+
+
+def get_portfolio_evolution(user_id, savings_rate_annual):
+    """
+    Reconstructs the daily value of the portfolio vs. a savings account.
+    Fixes 'Zero Price' bug by falling back to entry price if history is missing.
+    """
+    # 1. Fetch Transactions
+    recs = session.query(FinancialRecord).filter_by(user_id=user_id).order_by(FinancialRecord.date).all()
+    if not recs: return pd.DataFrame()
+
+    # 2. Setup Timeline
+    start_date = pd.Timestamp(recs[0].date.date())
+    end_date = pd.Timestamp(datetime.now().date())
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # 3. Initialize Dataframes
+    unique_isins = list(set([r.isin for r in recs if r.isin not in ['BANK', 'DEBT']]))
+    df_units = pd.DataFrame(0.0, index=date_range, columns=unique_isins)
+    df_invested = pd.Series(0.0, index=date_range)
+
+    # Track Entry Prices for Fallback
+    fallback_prices = {}
+
+    # 4. Process Transactions
+    for r in recs:
+        d = pd.Timestamp(r.date.date())
+        if d < start_date: d = start_date
+
+        # Capture the entry price for this ISIN in case we miss history later
+        if r.isin not in fallback_prices and r.entry_price > 0:
+            fallback_prices[r.isin] = r.entry_price
+
+        # Cumulative Invested
+        if d in df_invested.index:
+            df_invested.loc[d:] += r.amount
+
+        # Cumulative Units
+        if r.isin in unique_isins:
+            if d in df_units.index:
+                units = r.units_owned if r.units_owned else 0
+                df_units.loc[d:, r.isin] += units
+
+    # 5. Fetch Prices & Calculate Portfolio Value
+    df_prices = pd.DataFrame(index=date_range, columns=unique_isins)
+
+    for isin in unique_isins:
+        hist = session.query(FundPriceHistory).filter(
+            FundPriceHistory.isin == isin,
+            FundPriceHistory.date >= start_date
+        ).all()
+
+        # If we found history, map it
+        if hist:
+            temp_prices = {pd.Timestamp(h.date.date()): h.close_price for h in hist}
+            df_prices[isin] = df_prices.index.map(temp_prices)
+        else:
+            # SAFETY NET: No history found? Use the fallback entry price
+            # This prevents the line from dropping to 0
+            safe_price = fallback_prices.get(isin, 1.0)
+            df_prices[isin] = safe_price
+
+    # Clean the Data:
+    # 1. forward fill (cover weekends)
+    # 2. back fill (cover days before history started but after purchase)
+    # 3. fillna with fallback (absolute worst case)
+    df_prices = df_prices.ffill().bfill()
+
+    # Final check for any remaining NaNs (if no history AND no fallback)
+    df_prices = df_prices.fillna(1.0)
+
+    # Calculate Value
+    df_portfolio_val = (df_units * df_prices).sum(axis=1)
+
+    # 6. Calculate Savings Line
+    daily_rate = (1 + (savings_rate_annual / 100.0)) ** (1 / 365.0) - 1
+    savings_curve = []
+    curr_bal = 0.0
+
+    daily_flows = pd.Series(0.0, index=date_range)
+    for r in recs:
+        d = pd.Timestamp(r.date.date())
+        if d >= start_date and d <= end_date:
+            daily_flows.loc[d] += r.amount
+
+    for date in date_range:
+        flow = daily_flows.at[date]
+        curr_bal = (curr_bal * (1 + daily_rate)) + flow
+        savings_curve.append(curr_bal)
+
+    return pd.DataFrame({
+        "Invested": df_invested,
+        "Savings": savings_curve,
+        "Portfolio": df_portfolio_val
+    }, index=date_range)
 
 # --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):
@@ -839,7 +1133,9 @@ else:
                         st.warning("⚠️ Enter API Key.")
                     else:
                         agent = StrategyAgent(gemini_key, ai_model)
-                        user_prof = {'tax_residence': st.session_state.residences, 'risk': risk,
+                        user_prof = {'user_id': st.session_state.user_id,
+                                     'tax_residence': st.session_state.residences,
+                                     'risk': risk,
                                      'monthly_savings': session.query(User).get(
                                          st.session_state.user_id).monthly_savings_capacity}
                         bs = get_balance_sheet(st.session_state.user_id)
@@ -924,6 +1220,76 @@ else:
                         st.query_params["tab"] = "📊 Portfolio"  # Sync URL
                         st.rerun()
 
+
+        ###
+        # 1. Calculate & Display Rebalancing Gap
+        st.markdown("### ⚖️ Portfolio Rebalancing")
+
+        # --- DEFINITIONS FOR TOOLTIPS ---
+        BUCKET_DESCRIPTIONS = {
+            "Growth": "<b>High Risk / High Reward</b><br>Focus: Capital Appreciation.<br>Includes: Tech (QQQ), Global Indexes (SPY, MSCI World), Emerging Markets.",
+            "Defensive": "<b>Moderate Risk / Stability</b><br>Focus: Dividends & Low Volatility.<br>Includes: Healthcare, Energy (Equinor), Staples (Mowi/Seafood), Gold.",
+            "Cash": "<b>Zero Risk / Liquidity</b><br>Focus: Capital Preservation.<br>Includes: Bank Accounts, Money Market Funds, Short-term Bonds."
+        }
+
+        curr_exp, _ = get_portfolio_exposure(st.session_state.user_id)
+        target_model = RISK_MODELS.get(risk, RISK_MODELS["Growth"])
+
+        # Prepare Data for Chart
+        reb_data = []
+        for cat in ["Growth", "Defensive", "Cash"]:
+            c_val = curr_exp.get(cat, 0.0) * 100
+            t_val = target_model.get(cat, 0.0) * 100
+
+            # We add the 'Description' field here so Plotly can see it
+            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val, "Description": desc})
+            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val, "Description": desc})
+
+
+        # Prepare Data for Chart
+        reb_data = []
+        for cat in ["Growth", "Defensive", "Cash"]:
+            c_val = curr_exp.get(cat, 0.0) * 100
+            t_val = target_model.get(cat, 0.0) * 100
+            desc = BUCKET_DESCRIPTIONS.get(cat, "")
+
+            # We add the 'Description' field here so Plotly can see it
+            reb_data.append({"Category": cat, "Type": "Current", "% Allocation": c_val, "Description": desc})
+            reb_data.append({"Category": cat, "Type": "Target", "% Allocation": t_val, "Description": desc})
+
+        df_reb = pd.DataFrame(reb_data)
+
+        # Render Grouped Bar Chart with Custom Hover
+        fig_reb = px.bar(
+            df_reb,
+            x="Category",
+            y="% Allocation",
+            color="Type",
+            barmode="group",
+            color_discrete_map={"Current": "#EF553B", "Target": "#636EFA"},
+            title=f"Rebalancing Check ({risk} Profile)",
+            # 1. Pass the description column to custom_data
+            custom_data=["Description"]
+        )
+
+        # 2. Configure the Hover Template to show the description
+        fig_reb.update_traces(
+            hovertemplate="<b>%{x}</b><br>Allocation: %{y:.1f}%<br><br>%{customdata[0]}<extra></extra>"
+        )
+
+        st.plotly_chart(fig_reb, use_container_width=True)
+
+        # 2. Logic Check
+        # Optional: Show a warning if deviation is high
+        for cat, t_val in target_model.items():
+            c_val = curr_exp.get(cat, 0.0)
+            if c_val > (t_val + 0.10):
+                st.warning(
+                    f"⚠️ You are Overweight in {cat} ({c_val:.0%} vs {t_val:.0%}). AI will likely reduce exposure here.")
+        ###
+
+
+
     elif selected_tab == "📊 Portfolio":
         bs = get_balance_sheet(st.session_state.user_id)
         total_assets = sum(a['value'] for a in bs['assets']) + bs['market_portfolio_total']
@@ -944,24 +1310,260 @@ else:
             st.plotly_chart(px.pie(pd.DataFrame(data_pie), values='Value', names='Category'))
 
         st.markdown("---")
-        st.subheader("Market Portfolio Performance")
-        df_p = get_portfolio_df(st.session_state.user_id)
-        if not df_p.empty:
-            edited_df = st.data_editor(df_p, column_config={
-                "Delete?": st.column_config.CheckboxColumn("Remove", default=False),
-                "ID": st.column_config.NumberColumn(disabled=True)},
-                                       disabled=["ID", "Allocation", "ISIN", "Date", "Invested", "Current Value",
-                                                 "Profit", "Entry Price"], hide_index=True)
-            to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
-            if to_delete_ids:
-                if st.button(f"🗑️ Delete Selected Rows ({len(to_delete_ids)})"):
-                    delete_transactions(to_delete_ids)
-                    st.success("Deleted!")
-                    st.rerun()
 
-            fund_isins = sorted([x for x in df_p['ISIN'].unique() if x not in ['BANK', 'DEBT']])
+        # --- CONTROL BAR ---
+        col_head, col_ctrl = st.columns([3, 1])
+        col_head.subheader("Market Portfolio Performance")
+
+        # Risk Timeframe Selector
+        risk_timeframe = col_ctrl.selectbox(
+            "Risk Lookback",
+            options=["1wk", "1mo", "6mo", "1y"],
+            index=3,
+            format_func=lambda x: "Last " + x.replace("wk", "Week").replace("mo", "Month").replace("y", "Year")
+        )
+
+        # Fetch Raw Data
+        df_raw = get_portfolio_df(st.session_state.user_id, risk_period=risk_timeframe)
+
+        if not df_raw.empty:
+            # ==========================================
+            # 🆕 BENCHMARK COMPARISON (VS CASH)
+            # ==========================================
+            with st.container():
+                st.markdown("#### 🆚 Benchmark: Portfolio vs. Savings Account")
+
+                # 1. Controls
+                c_bench_1, c_bench_2, c_bench_3 = st.columns([1, 1, 2])
+
+                savings_rate_input = c_bench_1.number_input(
+                    "Savings Rate (%)",
+                    min_value=0.0, max_value=15.0, value=4.5, step=0.5
+                )
+
+                chart_type = c_bench_2.radio(
+                    "View Type",
+                    ["Bar (Snapshot)", "Line (History)", "🔮 Projection (5Y)"],
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+
+                # --- CALCULATE CURRENT STATE (Required for all views) ---
+                total_invested = df_raw['Invested'].sum()
+                current_portfolio_value = df_raw['Current Value'].sum()
+                hypothetical_cash_value = 0.0
+                today = datetime.now().date()
+
+                # Calculate Hypothetical Cash Value (Opportunity Cost)
+                for index, row in df_raw.iterrows():
+                    days_held = (today - row['Date']).days
+                    years_held = days_held / 365.25
+                    rate_decimal = savings_rate_input / 100.0
+                    hypothetical_cash_value += row['Invested'] * ((1 + rate_decimal) ** years_held)
+
+                # --- VIEW LOGIC ---
+                if chart_type == "Bar (Snapshot)":
+                    # [Keep your existing Bar Chart Logic here]
+                    alpha = current_portfolio_value - hypothetical_cash_value
+                    is_beating = alpha >= 0
+
+                    c_bench_3.metric(
+                        label=f"Value vs. {savings_rate_input}% Savings",
+                        value=f"{current_portfolio_value:,.0f} NOK",
+                        delta=f"{alpha:+,.0f} NOK",
+                        delta_color="normal"
+                    )
+
+                    bench_data = [
+                        {"Scenario": "1. Principal", "Value": total_invested, "Color": "LightGray",
+                         "Desc": "Total Cash Invested"},
+                        {"Scenario": f"2. Savings ({savings_rate_input}%)", "Value": hypothetical_cash_value,
+                         "Color": "#636EFA", "Desc": "Hypothetical Benchmark"},
+                        {"Scenario": "3. Your Portfolio", "Value": current_portfolio_value,
+                         "Color": "#00CC96" if is_beating else "#EF553B", "Desc": "Actual Market Value"}
+                    ]
+                    fig_bench = px.bar(pd.DataFrame(bench_data), x="Value", y="Scenario", orientation='h',
+                                       text="Value", color="Scenario",
+                                       color_discrete_map={d["Scenario"]: d["Color"] for d in bench_data},
+                                       custom_data=["Desc"])
+                    fig_bench.update_traces(texttemplate='%{text:,.0f}', textposition='auto',
+                                            hovertemplate="<b>%{y}</b><br>%{x:,.0f} NOK<br>%{customdata[0]}<extra></extra>")
+                    fig_bench.update_layout(showlegend=False, height=250, margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_bench, use_container_width=True)
+
+                elif chart_type == "Line (History)":
+                    # [Keep your existing Line Chart Logic here]
+                    # (Ensure you use the 'get_portfolio_evolution' function we fixed earlier)
+                    with st.spinner("Reconstructing history..."):
+                        df_history = get_portfolio_evolution(st.session_state.user_id, savings_rate_input)
+                    if not df_history.empty:
+                        latest = df_history.iloc[-1]
+                        raw_profit = latest['Portfolio'] - latest['Invested']
+                        alpha = latest['Portfolio'] - latest['Savings']
+                        c1, c2 = st.columns(2)
+                        c1.metric("Total Profit", f"{latest['Portfolio']:,.0f} NOK", f"{raw_profit:+,.0f} NOK")
+                        c2.metric("vs. Savings", f"{alpha:+,.0f} NOK", "Excess Return", delta_color="normal")
+
+                        fig_line = px.line(df_history, y=["Invested", "Savings", "Portfolio"], title="Past Performance",
+                                           color_discrete_map={"Invested": "gray", "Savings": "#636EFA",
+                                                               "Portfolio": "#00CC96" if alpha > 0 else "#EF553B"})
+                        fig_line.update_traces(patch={"line": {"dash": "dash"}}, selector={"name": "Invested"})
+                        fig_line.update_layout(hovermode="x unified", legend_title="", height=350)
+                        st.plotly_chart(fig_line, use_container_width=True)
+
+                else:
+                    # ==========================================
+                    # 🔮 NEW: FUTURE PROJECTION LOGIC
+                    # ==========================================
+
+                    # 1. Extra Input: Targeted Return
+                    target_return = c_bench_3.number_input(
+                        "Target Portfolio Return (%)",
+                        min_value=0.0, max_value=30.0, value=8.0, step=0.5,
+                        help="Assumed average annual return for your investment portfolio."
+                    )
+
+                    # 2. Generate Projection Data
+                    years = 5
+                    future_dates = pd.date_range(start=today, periods=years * 12, freq='ME')  # Monthly endpoints
+
+                    proj_data = []
+
+                    # Starting Values (From Today)
+                    val_savings = hypothetical_cash_value
+                    val_portfolio = current_portfolio_value
+
+                    # Monthly Rates
+                    r_save_mo = (savings_rate_input / 100) / 12
+                    r_port_mo = (target_return / 100) / 12
+
+                    for date in future_dates:
+                        # Compound Growth
+                        val_savings = val_savings * (1 + r_save_mo)
+                        val_portfolio = val_portfolio * (1 + r_port_mo)
+
+                        proj_data.append({
+                            "Date": date,
+                            "Scenario": f"Savings ({savings_rate_input}%)",
+                            "Value": val_savings
+                        })
+                        proj_data.append({
+                            "Date": date,
+                            "Scenario": f"Portfolio ({target_return}%)",
+                            "Value": val_portfolio
+                        })
+
+                    df_proj = pd.DataFrame(proj_data)
+
+                    # 3. Calculate 5-Year Outcome
+                    final_savings = df_proj[df_proj["Scenario"].str.contains("Savings")].iloc[-1]["Value"]
+                    final_port = df_proj[df_proj["Scenario"].str.contains("Portfolio")].iloc[-1]["Value"]
+                    diff = final_port - final_savings
+
+                    # 4. Visualization
+                    st.caption(f"Projecting values 5 years into the future based on assumed rates.")
+
+                    fig_proj = px.line(
+                        df_proj,
+                        x="Date",
+                        y="Value",
+                        color="Scenario",
+                        title="5-Year Wealth Projection",
+                        color_discrete_map={
+                            f"Savings ({savings_rate_input}%)": "#636EFA",
+                            f"Portfolio ({target_return}%)": "#00CC96" if diff > 0 else "#EF553B"
+                        }
+                    )
+
+                    # Add Area Fill to highlight the "Gap"
+                    fig_proj.update_traces(fill='tonexty')
+                    fig_proj.update_layout(hovermode="x unified", legend_title="", height=350)
+
+                    st.plotly_chart(fig_proj, use_container_width=True)
+
+                    # 5. Summary Text
+                    if diff > 0:
+                        st.success(
+                            f"🎉 **Potential Gain:** By sticking to your strategy, you could generate an extra **{diff:,.0f} NOK** over 5 years compared to the bank.")
+                    else:
+                        st.error(
+                            f"⚠️ **Warning:** At {target_return}%, your portfolio is projected to underperform the savings account by **{abs(diff):,.0f} NOK**.")
+
+                st.divider()
+
+            # ==========================================
+            # 1. CONSOLIDATED HOLDINGS TABLE
+            # ==========================================
+            st.markdown("#### 1. Current Holdings (Grouped)")
+
+            # Group by Fund Name and ISIN, Summing financial values
+            df_grouped = df_raw.groupby(['Allocation', 'ISIN']).agg({
+                'Invested': 'sum',
+                'Current Value': 'sum',
+                'Profit': 'sum',
+                'Volatility': 'first',  # Risk metrics are same for the fund
+                'Max Drawdown': 'first'
+            }).reset_index()
+
+            # Add "Return %" column for the group
+            df_grouped['Return %'] = (df_grouped['Profit'] / df_grouped['Invested'])
+
+
+            # Styling Logic (Red if Drawdown < -20%)
+            def highlight_risk(row):
+                if row['Max Drawdown'] < -0.20:
+                    return ['background-color: #ffcccc; color: #990000'] * len(row)
+                return [''] * len(row)
+
+
+            # Display Styled Table
+            st.dataframe(
+                df_grouped.style.apply(highlight_risk, axis=1).format({
+                    "Invested": "{:,.0f}",
+                    "Current Value": "{:,.0f}",
+                    "Profit": "{:+,.0f}",
+                    "Return %": "{:.1%}",
+                    "Volatility": "{:.1%}",
+                    "Max Drawdown": "{:.1%}"
+                }),
+                use_container_width=True,
+                column_order=["Allocation", "Invested", "Current Value", "Profit", "Return %", "Volatility",
+                              "Max Drawdown"]
+            )
+
+            # ==========================================
+            # 2. TRANSACTION LOG (DETAILED)
+            # ==========================================
+            with st.expander("📜 View Transaction Log & Edit History"):
+                st.markdown("#### Detailed Trade History")
+
+                # We use the raw dataframe here
+                edited_df = st.data_editor(
+                    df_raw,
+                    column_config={
+                        "Delete?": st.column_config.CheckboxColumn("Delete", default=False),
+                        "Date": st.column_config.DateColumn("Date", format="DD.MM.YYYY"),
+                        "ID": None,  # Hide ID
+                        "Volatility": None,  # Hide metrics in log view to reduce clutter
+                        "Max Drawdown": None
+                    },
+                    disabled=["Allocation", "ISIN", "Date", "Invested", "Current Value", "Profit"],
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+                to_delete_ids = edited_df[edited_df["Delete?"] == True]["ID"].tolist()
+                if to_delete_ids:
+                    if st.button(f"🗑️ Delete Selected Rows ({len(to_delete_ids)})"):
+                        delete_transactions(to_delete_ids)
+                        st.success("Deleted!")
+                        st.rerun()
+
+            # --- CHARTING ---
+            fund_isins = sorted([x for x in df_raw['ISIN'].unique() if x not in ['BANK', 'DEBT']])
             if fund_isins:
-                sel = st.selectbox("Chart Fund", fund_isins, format_func=get_safe_fund_name,
+                st.markdown("### Fund Performance Chart")
+                sel = st.selectbox("Select Fund", fund_isins, format_func=get_safe_fund_name,
                                    key="portfolio_chart_select")
                 fig = plot_history(session, st.session_state.user_id, sel, "kr", 1.0)
                 if fig: st.plotly_chart(fig)

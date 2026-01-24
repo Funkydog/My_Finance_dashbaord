@@ -763,6 +763,101 @@ def get_portfolio_exposure(user_id):
     exposure_pct = {k: round(v / total_val, 2) for k, v in current_counts.items()}
     return exposure_pct, total_val
 
+
+def get_portfolio_evolution(user_id, savings_rate_annual):
+    """
+    Reconstructs the daily value of the portfolio vs. a savings account.
+    Fixes 'Zero Price' bug by falling back to entry price if history is missing.
+    """
+    # 1. Fetch Transactions
+    recs = session.query(FinancialRecord).filter_by(user_id=user_id).order_by(FinancialRecord.date).all()
+    if not recs: return pd.DataFrame()
+
+    # 2. Setup Timeline
+    start_date = pd.Timestamp(recs[0].date.date())
+    end_date = pd.Timestamp(datetime.now().date())
+    date_range = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    # 3. Initialize Dataframes
+    unique_isins = list(set([r.isin for r in recs if r.isin not in ['BANK', 'DEBT']]))
+    df_units = pd.DataFrame(0.0, index=date_range, columns=unique_isins)
+    df_invested = pd.Series(0.0, index=date_range)
+
+    # Track Entry Prices for Fallback
+    fallback_prices = {}
+
+    # 4. Process Transactions
+    for r in recs:
+        d = pd.Timestamp(r.date.date())
+        if d < start_date: d = start_date
+
+        # Capture the entry price for this ISIN in case we miss history later
+        if r.isin not in fallback_prices and r.entry_price > 0:
+            fallback_prices[r.isin] = r.entry_price
+
+        # Cumulative Invested
+        if d in df_invested.index:
+            df_invested.loc[d:] += r.amount
+
+        # Cumulative Units
+        if r.isin in unique_isins:
+            if d in df_units.index:
+                units = r.units_owned if r.units_owned else 0
+                df_units.loc[d:, r.isin] += units
+
+    # 5. Fetch Prices & Calculate Portfolio Value
+    df_prices = pd.DataFrame(index=date_range, columns=unique_isins)
+
+    for isin in unique_isins:
+        hist = session.query(FundPriceHistory).filter(
+            FundPriceHistory.isin == isin,
+            FundPriceHistory.date >= start_date
+        ).all()
+
+        # If we found history, map it
+        if hist:
+            temp_prices = {pd.Timestamp(h.date.date()): h.close_price for h in hist}
+            df_prices[isin] = df_prices.index.map(temp_prices)
+        else:
+            # SAFETY NET: No history found? Use the fallback entry price
+            # This prevents the line from dropping to 0
+            safe_price = fallback_prices.get(isin, 1.0)
+            df_prices[isin] = safe_price
+
+    # Clean the Data:
+    # 1. forward fill (cover weekends)
+    # 2. back fill (cover days before history started but after purchase)
+    # 3. fillna with fallback (absolute worst case)
+    df_prices = df_prices.ffill().bfill()
+
+    # Final check for any remaining NaNs (if no history AND no fallback)
+    df_prices = df_prices.fillna(1.0)
+
+    # Calculate Value
+    df_portfolio_val = (df_units * df_prices).sum(axis=1)
+
+    # 6. Calculate Savings Line
+    daily_rate = (1 + (savings_rate_annual / 100.0)) ** (1 / 365.0) - 1
+    savings_curve = []
+    curr_bal = 0.0
+
+    daily_flows = pd.Series(0.0, index=date_range)
+    for r in recs:
+        d = pd.Timestamp(r.date.date())
+        if d >= start_date and d <= end_date:
+            daily_flows.loc[d] += r.amount
+
+    for date in date_range:
+        flow = daily_flows.at[date]
+        curr_bal = (curr_bal * (1 + daily_rate)) + flow
+        savings_curve.append(curr_bal)
+
+    return pd.DataFrame({
+        "Invested": df_invested,
+        "Savings": savings_curve,
+        "Portfolio": df_portfolio_val
+    }, index=date_range)
+
 # --- UPDATED PLOT WITH ENVELOPES ---
 def plot_history(session, user_id, isin, currency_sym, rate):
     # 1. Fetch History
@@ -1238,6 +1333,143 @@ else:
         df_raw = get_portfolio_df(st.session_state.user_id, risk_period=risk_timeframe)
 
         if not df_raw.empty:
+            # ==========================================
+            # 🆕 BENCHMARK COMPARISON (VS CASH)
+            # ==========================================
+            with st.container():
+                st.markdown("#### 🆚 Benchmark: Portfolio vs. Savings Account")
+
+                # 1. Controls
+                c_bench_1, c_bench_2, c_bench_3 = st.columns([1, 1, 2])
+
+                savings_rate_input = c_bench_1.number_input(
+                    "Savings Rate (%)",
+                    min_value=0.0, max_value=15.0, value=4.5, step=0.5
+                )
+
+                chart_type = c_bench_2.radio(
+                    "View Type",
+                    ["Bar (Snapshot)", "Line (History)"],
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+
+                # 2. Logic Switch
+                if chart_type == "Bar (Snapshot)":
+                    # --- EXISTING CALCULATION LOGIC ---
+                    total_invested = df_raw['Invested'].sum()
+                    current_portfolio_value = df_raw['Current Value'].sum()
+                    hypothetical_cash_value = 0.0
+                    today = datetime.now().date()
+
+                    for index, row in df_raw.iterrows():
+                        days_held = (today - row['Date']).days
+                        years_held = days_held / 365.25
+                        rate_decimal = savings_rate_input / 100.0
+                        hypothetical_cash_value += row['Invested'] * ((1 + rate_decimal) ** years_held)
+
+                    alpha = current_portfolio_value - hypothetical_cash_value
+                    is_beating = alpha >= 0
+
+                    # Display Metrics
+                    c_bench_3.metric(
+                        label=f"Value vs. {savings_rate_input}% Savings",
+                        value=f"{current_portfolio_value:,.0f} NOK",
+                        delta=f"{alpha:+,.0f} NOK",
+                        delta_color="normal"
+                    )
+
+                    # --- PREPARE DATA WITH DESCRIPTIONS ---
+                    bench_data = [
+                        {
+                            "Scenario": "1. Principal",
+                            "Value": total_invested,
+                            "Color": "LightGray",
+                            "Desc": "<b>Total Cash Invested</b><br>The sum of all transfers you made into the market."
+                        },
+                        {
+                            "Scenario": f"2. Savings ({savings_rate_input}%)",
+                            "Value": hypothetical_cash_value,
+                            "Color": "#636EFA",
+                            "Desc": f"<b>Hypothetical Benchmark</b><br>What your money would be worth today if you had<br>left it in a bank account at {savings_rate_input}% interest."
+                        },
+                        {
+                            "Scenario": "3. Your Portfolio",
+                            "Value": current_portfolio_value,
+                            "Color": "#00CC96" if is_beating else "#EF553B",
+                            "Desc": "<b>Actual Market Value</b><br>The current value of your holdings based on latest prices."
+                        }
+                    ]
+
+                    df_bench = pd.DataFrame(bench_data)
+
+                    # --- PLOT WITH CUSTOM HOVER ---
+                    fig_bench = px.bar(
+                        df_bench,
+                        x="Value",
+                        y="Scenario",
+                        orientation='h',
+                        text="Value",
+                        color="Scenario",
+                        color_discrete_map={d["Scenario"]: d["Color"] for d in bench_data},
+                        # 1. Pass the description to the chart data
+                        custom_data=["Desc"]
+                    )
+
+                    # 2. Update the tooltip format
+                    fig_bench.update_traces(
+                        texttemplate='%{text:,.0f}',
+                        textposition='auto',
+                        hovertemplate="<b>%{y}</b><br>Value: %{x:,.0f} NOK<br><br>%{customdata[0]}<extra></extra>"
+                    )
+
+                    fig_bench.update_layout(showlegend=False, height=250, margin=dict(l=0, r=0, t=10, b=0))
+                    st.plotly_chart(fig_bench, use_container_width=True)
+
+                else:
+                    # --- NEW LINE CHART LOGIC ---
+                    with st.spinner("Reconstructing portfolio history..."):
+                        df_history = get_portfolio_evolution(st.session_state.user_id, savings_rate_input)
+
+                    if not df_history.empty:
+                        # 1. Metrics
+                        latest = df_history.iloc[-1]
+                        raw_profit = latest['Portfolio'] - latest['Invested']
+                        alpha = latest['Portfolio'] - latest['Savings']
+
+                        c1, c2 = st.columns(2)
+                        c1.metric("Total Profit (Raw)", f"{latest['Portfolio']:,.0f} NOK", f"{raw_profit:+,.0f} NOK")
+                        c2.metric("vs. Savings (Alpha)", f"{alpha:+,.0f} NOK", "Real Excess Return",
+                                  delta_color="normal")
+
+                        # 2. The Chart
+                        fig_line = px.line(df_history, y=["Invested", "Savings", "Portfolio"],
+                                           title="Performance Evolution",
+                                           color_discrete_map={
+                                               "Invested": "gray",
+                                               "Savings": "#636EFA",
+                                               "Portfolio": "#00CC96" if alpha > 0 else "#EF553B"
+                                           })
+
+                        # Style: Dashed line for Invested to show it's the baseline
+                        fig_line.update_traces(patch={"line": {"dash": "dash"}}, selector={"name": "Invested"})
+                        fig_line.update_layout(hovermode="x unified", legend_title="", height=350)
+
+                        st.plotly_chart(fig_line, use_container_width=True)
+
+                        # 3. 🆕 DESCRIPTION / LEGEND
+                        st.info("""
+                                            **📝 Chart Guide:**
+                                            - **Invested (Gray):** The actual hard cash you transferred into the market (Principal).
+                                            - **Savings (Blue):** A **hypothetical scenario** showing what your wealth *would* be if you had simply deposited that cash into a bank account at the selected interest rate instead of investing.
+                                            - **Portfolio (Green/Red):** The actual current market value of your funds. 
+                                            """)
+
+                    else:
+                        st.warning("Not enough history to generate line chart.")
+
+                st.divider()
+
             # ==========================================
             # 1. CONSOLIDATED HOLDINGS TABLE
             # ==========================================

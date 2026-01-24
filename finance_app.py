@@ -481,12 +481,6 @@ def update_price_history(isin):
     except:
         pass
 
-
-#Done: make sure that the prices get updated only if there are not already in the database, update only the missing ones
-#Done: Close the gap between imported price and time and date and new investment time and date
-#Done: When backtest is selected, there is an error - the button submit seems not the be working - check cause
-#Done: Show the moving average on the graph
-#Done: Make a logic when price is above moving average give a message alert to the user, and if the moving average is above the envolope recommend not to invest in this fund until the prices are down into the envolope zone
 #TODO: make a warning message if the fund is not updated as of today (due to lack of data from yahoo)
 
 # --- NEW: AUTO-UPDATE ON LOGIN ---
